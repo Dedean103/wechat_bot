@@ -1,0 +1,5 @@
+# Durable research reports and local deployment material
+ai/memo/
+
+# Local bridge credential (the nested project's .gitignore protects its other runtime state)
+wechat-time/.env

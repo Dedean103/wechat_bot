@@ -1,0 +1,18 @@
+[Unit]
+Description=wechat-channel bridge for Codex
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dedeanzheng
+WorkingDirectory=/home/dedeanzheng/memo/wechat-time
+Environment=HOME=/home/dedeanzheng
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/dedeanzheng/.local/bin
+ExecStart=/usr/bin/python3 /home/dedeanzheng/memo/wechat-time/scripts/wechat_bridge.py run
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
