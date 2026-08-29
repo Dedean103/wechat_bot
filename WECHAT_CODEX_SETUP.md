@@ -20,7 +20,8 @@
 ├── ai/memo/
 │   ├── VPS_DEPLOY_PLAN.md
 │   ├── DEPLOY_REMOTE.md
-│   ├── YYMMDD-<subject>.md   # completed research reports
+│   ├── investigation/
+│   │   └── YYMMDD-<subject>.md   # completed research reports
 │   └── qrcode.png
 ├── wechat-time/
 │   ├── .env                       # sensitive Notion runtime credential; mode 600, Git-ignored
@@ -139,8 +140,9 @@ preferred research presentation: conclusion first, scope, comparison table,
 key evidence/cost or configuration breakdown, risks, recommendation,
 limitations, and sources (小红书 reports label their sources as `参考笔记`).
 
-The bridge saves the final report only in `ai/memo/` and sends that same file
-back through WeChat. Names use China-local date and a safe subject slug:
+The bridge saves the final report only in `ai/memo/investigation/` and sends
+that same file back through WeChat. Names use China-local date and a safe
+subject slug:
 
 ```text
 YYMMDD-<subject>.md

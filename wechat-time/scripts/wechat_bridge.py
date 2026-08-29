@@ -157,7 +157,7 @@ CODEX_NATIVE = bool(CODEX_JS) and not CODEX_JS.lower().endswith(".js")  # 原生
 INBOX_DIR = Path(CODEX_WORK_DIR) / "inbox"
 MEMORY_FILE = Path(CODEX_WORK_DIR) / "wechat_memory.md"  # 每轮注入 + 对话后写回摘要
 MEMORY_MAX_ENTRIES = 30
-RESEARCH_ARCHIVE_DIR = HERE.parent.parent / "ai" / "memo"
+RESEARCH_ARCHIVE_DIR = HERE.parent.parent / "ai" / "memo" / "investigation"
 
 # ── 稳定性参数 ──────────────────────────────────────────────────────
 CB_FAILURE_THRESHOLD = 6          # 连续失败次数 → 跳闸 OPEN
@@ -363,7 +363,7 @@ def _research_instruction(route):
 
 
 def _save_research_report(text, request_text):
-    """Save the final report in the durable ai/memo archive."""
+    """Save the final report in the durable ai/memo/investigation archive."""
     from zoneinfo import ZoneInfo
     try:
         RESEARCH_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
