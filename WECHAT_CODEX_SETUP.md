@@ -230,6 +230,19 @@ The Notion credential is stored only in `wechat-time/.env` as
 `wechat-time` Git repository. Do not add this credential to documentation,
 source code, or Git.
 
+## Knowledge capture
+
+Send a WeChat message containing the standalone English keyword `knowledge`
+(case-insensitive) or the Chinese keyword `知识`. The bridge removes every
+occurrence of the keyword and appends the remaining text to
+`ai/memo/knowledge.md`, then confirms the saved text in WeChat. For example,
+`knowledge PostgreSQL backups run nightly` appends
+`PostgreSQL backups run nightly`.
+
+The keyword is a reserved bridge command: after a successful capture, that
+message is not sent to the normal Codex conversation or reminder flow. A
+keyword without any remaining content is rejected.
+
 ## Security and capacity
 
 - Codex app-server uses `approvalPolicy=never` and `danger-full-access`; this

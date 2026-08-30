@@ -158,6 +158,7 @@ INBOX_DIR = Path(CODEX_WORK_DIR) / "inbox"
 MEMORY_FILE = Path(CODEX_WORK_DIR) / "wechat_memory.md"  # 每轮注入 + 对话后写回摘要
 MEMORY_MAX_ENTRIES = 30
 RESEARCH_ARCHIVE_DIR = HERE.parent.parent / "ai" / "memo" / "investigation"
+KNOWLEDGE_FILE = HERE.parent.parent / "ai" / "memo" / "knowledge.md"
 
 # ── 稳定性参数 ──────────────────────────────────────────────────────
 CB_FAILURE_THRESHOLD = 6          # 连续失败次数 → 跳闸 OPEN
@@ -1546,6 +1547,29 @@ def _extract_long_task(text):
     return task or ""
 
 
+_KNOWLEDGE_RE = re.compile(r"(?<![A-Za-z])knowledge(?![A-Za-z])|知识", re.IGNORECASE)
+
+
+def _extract_knowledge(text):
+    """Remove explicit knowledge keywords and return the note to capture."""
+    raw = str(text or "")
+    if not _KNOWLEDGE_RE.search(raw):
+        return None
+    note = _KNOWLEDGE_RE.sub("", raw).strip(" \t\r\n，,。；;:：-—()（）[]【】")
+    return note or ""
+
+
+def _append_knowledge(note):
+    """Append one captured note to the durable Markdown knowledge file."""
+    KNOWLEDGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with _state_lock:
+        needs_newline = KNOWLEDGE_FILE.exists() and KNOWLEDGE_FILE.stat().st_size > 0
+        with KNOWLEDGE_FILE.open("a", encoding="utf-8") as handle:
+            if needs_newline:
+                handle.write("\n")
+            handle.write(str(note).strip() + "\n")
+
+
 def _reminder_db():
     """Open reminder storage; every thread gets its own SQLite connection."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -2413,6 +2437,19 @@ class Bridge:
                     lines.append(f"第{i}个：{s.get('desc', '')}（{str(s.get('ts', ''))[:16]}）")
                 lines.append("回复「切回第N个」切换")
                 self.send_weixin("\n".join(lines))
+            return
+        knowledge = _extract_knowledge(text)
+        if knowledge is not None:
+            if not knowledge:
+                self.send_weixin("请在 knowledge 或“知识”后写清楚要保存的内容。")
+                return
+            try:
+                _append_knowledge(knowledge)
+                self.send_weixin(f"已保存到 knowledge.md：{knowledge}")
+            except Exception as e:
+                log(f"知识记录写入失败: {type(e).__name__}: {str(e)[:120]}")
+                self.send_weixin("写入 knowledge.md 失败，内容没有保存，请稍后重试。")
+            self.save_state()
             return
         long_task = _extract_long_task(text)
         if long_task is not None:
