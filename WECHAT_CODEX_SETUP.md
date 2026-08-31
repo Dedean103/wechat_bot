@@ -14,12 +14,14 @@
 - Notion long tasks: active; live resolver verified against the current weekly page
 - Investigation completion records: active; successful reports are recorded in `ai/memo/knowledge.md`
 - Question knowledge lookup: active; messages ending in `?` or `？` use available knowledge as reference context
+- Diary capture: active; `diary`/`日记` entries are saved newest-first to `ai/memo/diary.md` and synchronized to the Notion diary page
 
 ## Layout
 
 ```text
 /home/dedeanzheng/memo/
 ├── ai/memo/
+│   ├── diary.md               # newest-first diary entries
 │   ├── VPS_DEPLOY_PLAN.md
 │   ├── DEPLOY_REMOTE.md
 │   ├── investigation/
@@ -69,7 +71,8 @@ Bridge config: `wechat-time/scripts/weixin_bridge/backend.json`
   "chat_effort": "medium",
   "casual_effort": "low",
   "task_model": "gpt-5.6-luna",
-  "task_effort": "medium"
+  "task_effort": "medium",
+  "notion_diary_page_id": "39571e16-c3e7-81e9-a980-e9583a3ed66d"
 }
 ```
 
@@ -255,6 +258,30 @@ For an incoming message whose final character is `?` or `？`, the bridge reads
 Codex as reference context. The answer prioritizes relevant knowledge entries;
 if there is no relevant entry, it answers normally. Knowledge context is capped
 at the most recent 16 KB to keep question handling bounded.
+
+## Diary capture
+
+Send a WeChat message containing the standalone English keyword `diary`
+(case-insensitive) or the Chinese keyword `日记`, followed by a thought. The
+bridge removes the keyword and saves the remaining text to
+`ai/memo/diary.md`. Entries use the format below and are inserted newest first,
+with the newest entry directly below the matching date heading:
+
+```md
+## 2026-08-31
+
+- 14:30: 今天的想法
+```
+
+The same thought is also written to the configured Notion diary page through
+the shared `NotionDiaryManager` used by the scheduler. The Notion page ID is a
+non-secret `notion_diary_page_id` value in
+`wechat-time/scripts/weixin_bridge/backend.json`; the Notion access token
+remains only in `wechat-time/.env`.
+
+The local diary is saved first. If Notion is temporarily unavailable, the
+local entry is retained and WeChat reports that the Notion write failed. A
+message containing only `diary` or `日记` is rejected.
 
 ## Security and capacity
 

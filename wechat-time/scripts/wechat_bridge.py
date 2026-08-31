@@ -24,6 +24,7 @@ Codex 微信桥（专线版 v2 — 稳定性加固）— iLink Bot API ↔ Codex
 import ctypes
 import base64
 import hashlib
+import importlib.util
 import json
 import os
 import queue
@@ -159,6 +160,9 @@ MEMORY_FILE = Path(CODEX_WORK_DIR) / "wechat_memory.md"  # 每轮注入 + 对话
 MEMORY_MAX_ENTRIES = 30
 RESEARCH_ARCHIVE_DIR = HERE.parent.parent / "ai" / "memo" / "investigation"
 KNOWLEDGE_FILE = HERE.parent.parent / "ai" / "memo" / "knowledge.md"
+DIARY_FILE = HERE.parent.parent / "ai" / "memo" / "diary.md"
+NOTION_DIARY_MANAGER_FILE = Path("/home/dedeanzheng/test_env/schduler/notion/notion_diary.py")
+_NOTION_DIARY_MANAGER_CLASS = None
 
 # ── 稳定性参数 ──────────────────────────────────────────────────────
 CB_FAILURE_THRESHOLD = 6          # 连续失败次数 → 跳闸 OPEN
@@ -1583,6 +1587,72 @@ def _append_knowledge(note):
             handle.write(str(note).strip() + "\n")
 
 
+_DIARY_RE = re.compile(r"(?<![A-Za-z])diary(?![A-Za-z])|日记", re.IGNORECASE)
+
+
+def _extract_diary(text):
+    """Remove an explicit diary keyword and return the thought to capture."""
+    raw = str(text or "")
+    if not _DIARY_RE.search(raw):
+        return None
+    note = _DIARY_RE.sub("", raw).strip(" \t\r\n，,。；;:：-—()（）[]【】")
+    return note or ""
+
+
+def _append_diary_local(note, timestamp=None):
+    """Insert one timestamped thought at the newest position in diary.md."""
+    from zoneinfo import ZoneInfo
+
+    local_time = (timestamp or datetime.now(timezone.utc)).astimezone(ZoneInfo(REMINDER_TIMEZONE))
+    date_heading = f"## {local_time:%Y-%m-%d}"
+    thought = str(note).strip().replace("\r\n", "\n").replace("\r", "\n")
+    thought = thought.replace("\n", "\n  ")
+    entry = f"- {local_time:%H:%M}: {thought}"
+
+    with _state_lock:
+        content = DIARY_FILE.read_text(encoding="utf-8") if DIARY_FILE.exists() else ""
+        lines = content.splitlines()
+        heading_index = next((i for i, line in enumerate(lines) if line.strip() == date_heading), None)
+        if heading_index is None:
+            updated_lines = [date_heading, "", entry]
+            if lines:
+                updated_lines.extend(["", *lines])
+        else:
+            updated_lines = lines[:heading_index + 1] + ["", entry] + lines[heading_index + 1:]
+        DIARY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temp_file = DIARY_FILE.with_suffix(".md.tmp")
+        temp_file.write_text("\n".join(updated_lines).rstrip("\n") + "\n", encoding="utf-8")
+        os.replace(temp_file, DIARY_FILE)
+
+
+def _notion_diary_manager(page_id):
+    """Load the tested scheduler NotionDiaryManager without importing its package."""
+    global _NOTION_DIARY_MANAGER_CLASS
+    if _NOTION_DIARY_MANAGER_CLASS is None:
+        if not NOTION_DIARY_MANAGER_FILE.exists():
+            raise RuntimeError(f"找不到 Notion 日记管理器: {NOTION_DIARY_MANAGER_FILE}")
+        spec = importlib.util.spec_from_file_location("wechat_reused_notion_diary", NOTION_DIARY_MANAGER_FILE)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("无法加载 Notion 日记管理器")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _NOTION_DIARY_MANAGER_CLASS = module.NotionDiaryManager
+    from zoneinfo import ZoneInfo
+
+    return _NOTION_DIARY_MANAGER_CLASS(
+        token=_notion_token(),
+        page_id=page_id,
+        tzinfo=ZoneInfo(REMINDER_TIMEZONE),
+    )
+
+
+def _append_diary_notion(note, timestamp, page_id):
+    """Append the thought through the scheduler's shared Notion diary manager."""
+    if not page_id:
+        raise RuntimeError("未配置 Notion 日记页面 ID")
+    _notion_diary_manager(page_id).append_message(str(note).strip(), timestamp)
+
+
 def _reminder_db():
     """Open reminder storage; every thread gets its own SQLite connection."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -2462,6 +2532,29 @@ class Bridge:
             except Exception as e:
                 log(f"知识记录写入失败: {type(e).__name__}: {str(e)[:120]}")
                 self.send_weixin("写入 knowledge.md 失败，内容没有保存，请稍后重试。")
+            self.save_state()
+            return
+        diary = _extract_diary(text)
+        if diary is not None:
+            if not diary:
+                self.send_weixin("请在 diary 或“日记”后写清楚要记录的想法。")
+                return
+            timestamp = datetime.now(timezone.utc)
+            try:
+                _append_diary_local(diary, timestamp)
+            except Exception as e:
+                log(f"日记本地写入失败: {type(e).__name__}: {str(e)[:120]}")
+                self.send_weixin("写入 diary.md 失败，内容没有保存，请稍后重试。")
+                self.save_state()
+                return
+            notion_page_id = str((self.backend_cfg or {}).get("notion_diary_page_id") or os.environ.get("NOTION_DIARY_PAGE_ID", "")).strip()
+            try:
+                _append_diary_notion(diary, timestamp, notion_page_id)
+            except Exception as e:
+                log(f"Notion 日记写入失败: {type(e).__name__}: {str(e)[:120]}")
+                self.send_weixin("已保存到 diary.md，但写入 Notion 日记失败，请稍后重试。")
+            else:
+                self.send_weixin("已保存到 diary.md 和 Notion 日记。")
             self.save_state()
             return
         long_task = _extract_long_task(text)
