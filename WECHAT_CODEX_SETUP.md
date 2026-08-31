@@ -153,6 +153,11 @@ report is preserved with `-2`, `-3`, and so on; it never overwrites an earlier
 report. The legacy `wechat_work/research/` directory is no longer used for new
 reports.
 
+After a report is successfully saved, the bridge appends a completion record to
+`ai/memo/knowledge.md` in the form
+`{title} completed, reported {filename}`. If the report cannot be saved, no
+completion record is added.
+
 ## Calendar reminders
 
 The bridge contains a Codex-interpreted calendar-reminder flow. Every incoming
@@ -242,6 +247,12 @@ occurrence of the keyword and appends the remaining text to
 The keyword is a reserved bridge command: after a successful capture, that
 message is not sent to the normal Codex conversation or reminder flow. A
 keyword without any remaining content is rejected.
+
+For an incoming message whose final character is `?` or `？`, the bridge reads
+`ai/memo/knowledge.md` first when it contains content and gives that content to
+Codex as reference context. The answer prioritizes relevant knowledge entries;
+if there is no relevant entry, it answers normally. Knowledge context is capped
+at the most recent 16 KB to keep question handling bounded.
 
 ## Security and capacity
 

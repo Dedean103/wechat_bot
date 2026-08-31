@@ -1265,6 +1265,19 @@ def _load_memory():
     return ""
 
 
+def _load_knowledge():
+    """读取持久化知识；问题消息会把它作为额外上下文注入。"""
+    try:
+        if KNOWLEDGE_FILE.exists():
+            text = KNOWLEDGE_FILE.read_text(encoding="utf-8", errors="replace").strip()
+            if len(text) > 16000:
+                text = "（较早内容已省略，仅保留最近的知识记录）\n" + text[-16000:]
+            return text
+    except Exception as e:
+        log(f"知识读取失败: {str(e)[:80]}")
+    return ""
+
+
 def _append_memory(entry):
     """对话后追加一行摘要到记忆文件（原子写 + 锁，超量滚动裁剪）。"""
     try:
@@ -2671,6 +2684,12 @@ class Bridge:
         if not path:
             return False
         try:
+            title = _research_subject(request_text)
+            _append_knowledge(f"{title} completed, reported {path.name}")
+        except Exception as e:
+            # Report delivery must still succeed if the optional knowledge update fails.
+            log(f"调研完成记录写入知识库失败: {str(e)[:120]}")
+        try:
             if self.send_file(str(path)):
                 self.send_weixin(f"调研完成，报告已生成并发送：{path.name}")
                 return True
@@ -2703,8 +2722,16 @@ class Bridge:
             identity = BACKEND_IDENTITY.get(self.backend, "Codex")
             mem = _load_memory()
             memory_block = ("【微信桥记忆】\n" + mem + "\n\n") if mem else ""
+            knowledge = _load_knowledge() if text.strip().endswith(("?", "？")) else ""
+            knowledge_block = (
+                "【知识库参考】\n"
+                "以下是本地 knowledge.md 的内容。回答用户问题时，优先参考其中"
+                "与问题相关的信息；如果没有相关内容，再按正常方式回答。不要声称"
+                "知识库中有不存在的内容。\n"
+                + knowledge + "\n\n"
+            ) if knowledge else ""
             research_hint = _research_instruction(research_route) if research_route else ""
-            prompt = memory_block + SYSTEM_HINT.format(identity=identity) + research_hint + text
+            prompt = knowledge_block + memory_block + SYSTEM_HINT.format(identity=identity) + research_hint + text
             base_prompt = PRIMER.format(identity=identity) if not sid else ""
             on_progress = self.send_weixin
             cfg = self.backend_cfg or {}
