@@ -12,6 +12,8 @@
 - End-to-end WeChat → Codex → WeChat test: passed
 - Calendar reminders: active; verified against the iCloud `AI助手` calendar
 - Notion long tasks: active; live resolver verified against the current weekly page
+- Investigation completion records: active; successful reports are recorded in `ai/memo/knowledge.md`
+- Question knowledge lookup: active; messages ending in `?` or `？` use available knowledge as reference context
 
 ## Layout
 
