@@ -41,11 +41,12 @@ import urllib.request
 import urllib.parse
 import uuid
 from collections import deque
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from Crypto.Cipher import AES
 
 HERE = Path(__file__).parent
+REPO_ROOT = HERE.parent.parent
 DATA_DIR = HERE / "weixin_bridge"
 ENV_FILE = HERE.parent / ".env"
 ACCOUNT_FILE = DATA_DIR / "account.json"
@@ -158,9 +159,9 @@ CODEX_NATIVE = bool(CODEX_JS) and not CODEX_JS.lower().endswith(".js")  # 原生
 INBOX_DIR = Path(CODEX_WORK_DIR) / "inbox"
 MEMORY_FILE = Path(CODEX_WORK_DIR) / "wechat_memory.md"  # 每轮注入 + 对话后写回摘要
 MEMORY_MAX_ENTRIES = 30
-RESEARCH_ARCHIVE_DIR = HERE.parent.parent / "ai" / "memo" / "investigation"
-KNOWLEDGE_FILE = HERE.parent.parent / "ai" / "memo" / "knowledge.md"
-DIARY_FILE = HERE.parent.parent / "ai" / "memo" / "diary.md"
+RESEARCH_ARCHIVE_DIR = REPO_ROOT / "ai" / "memo" / "investigation"
+KNOWLEDGE_FILE = REPO_ROOT / "ai" / "memo" / "knowledge.md"
+DIARY_FILE = REPO_ROOT / "ai" / "memo" / "diary.md"
 NOTION_DIARY_MANAGER_FILE = Path("/home/dedeanzheng/test_env/schduler/notion/notion_diary.py")
 _NOTION_DIARY_MANAGER_CLASS = None
 
@@ -1482,27 +1483,24 @@ def _notion_normalize_task(value):
 
 
 def _notion_week_page(today):
-    """Resolve today's weekly page below the current YYYY-MM Habit Tracker page."""
-    month_title = today.strftime("%Y-%m")
+    """Resolve today's weekly page, including weeks stored under either month."""
+    week_start = today - timedelta(days=today.weekday())
+    week_end = week_start + timedelta(days=6)
+    week_title = f"{week_start:%m%d}-{week_end:%m%d}"
+    month_titles = []
+    for month_title in (week_start.strftime("%Y-%m"), week_end.strftime("%Y-%m")):
+        if month_title not in month_titles:
+            month_titles.append(month_title)
     tracker_children = _notion_children(NOTION_HABIT_TRACKER_ID)
-    month = next((block for block in tracker_children
-                  if block.get("type") == "child_page" and _notion_block_text(block) == month_title), None)
-    if not month:
-        raise RuntimeError(f"找不到 {month_title} 的 Notion 月度页面")
-    for block in _notion_children(month["id"]):
-        if block.get("type") != "child_page":
+    months = { _notion_block_text(block): block for block in tracker_children
+                if block.get("type") == "child_page" }
+    for month_title in month_titles:
+        month = months.get(month_title)
+        if not month:
             continue
-        match = re.fullmatch(r"\s*(\d{2})(\d{2})-(\d{2})(\d{2})\s*", _notion_block_text(block))
-        if not match:
-            continue
-        sm, sd, em, ed = map(int, match.groups())
-        try:
-            starts = date(today.year, sm, sd)
-            ends = date(today.year + (1 if (em, ed) < (sm, sd) else 0), em, ed)
-        except ValueError:
-            continue
-        if starts <= today <= ends:
-            return block
+        for block in _notion_children(month["id"]):
+            if block.get("type") == "child_page" and _notion_block_text(block) == week_title:
+                return block
     raise RuntimeError("找不到包含今天的 Notion 周计划页面")
 
 

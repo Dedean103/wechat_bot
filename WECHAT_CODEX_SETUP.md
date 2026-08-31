@@ -12,6 +12,7 @@
 - End-to-end WeChat → Codex → WeChat test: passed
 - Calendar reminders: active; verified against the iCloud `AI助手` calendar
 - Notion long tasks: active; live resolver verified against the current weekly page
+- Notion week lookup: checks both the week-start and week-end month pages, including year-crossing weeks
 - Investigation completion records: active; successful reports are recorded in `ai/memo/knowledge.md`
 - Question knowledge lookup: active; messages ending in `?` or `？` use available knowledge as reference context
 - Diary capture: active; `diary`/`日记` entries are saved newest-first to `ai/memo/diary.md` and synchronized to the Notion diary page
@@ -79,6 +80,15 @@ Bridge config: `wechat-time/scripts/weixin_bridge/backend.json`
 The model fields must be explicit. Empty fields fall back to the bridge's
 hard-coded `deepseek-v4-flash`; they do not inherit `config.toml`.
 Since this VPS has no DeepSeek proxy, empty fields cause “暂时连不上模型服务”.
+
+The bridge source uses the repository root (`/home/dedeanzheng/memo`) as the
+base for durable AI data. Therefore research reports are saved to
+`/home/dedeanzheng/memo/ai/memo/investigation/`, completion records to
+`/home/dedeanzheng/memo/ai/memo/knowledge.md`, and diary entries to
+`/home/dedeanzheng/memo/ai/memo/diary.md`. The agent work directory remains
+`/home/dedeanzheng/memo/wechat-time/wechat_work/` for temporary work, memory,
+and received inbox files; it is not the archive location for new research
+reports.
 
 ## Service operations
 
@@ -162,6 +172,15 @@ After a report is successfully saved, the bridge appends a completion record to
 `ai/memo/knowledge.md` in the form
 `{title} completed, reported {filename}`. If the report cannot be saved, no
 completion record is added.
+
+## Notion cross-month weeks
+
+Notion weekly pages are titled `MMDD-MMDD` and may be filed under either the
+month containing Monday or the month containing Sunday. For example, the week
+`0831-0906` may be under `2026-09` even when the current date is August 31.
+The resolver calculates the current Monday–Sunday range, checks both candidate
+month pages beneath `Habit Tracker`, and matches the exact weekly-page title.
+This also handles weeks crossing December and January.
 
 ## Calendar reminders
 
