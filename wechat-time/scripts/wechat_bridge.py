@@ -1271,7 +1271,7 @@ def _load_memory():
 
 
 def _load_knowledge():
-    """读取持久化知识；问题消息会把它作为额外上下文注入。"""
+    """读取持久化知识，作为问题消息的最高优先级事实来源。"""
     try:
         if KNOWLEDGE_FILE.exists():
             text = KNOWLEDGE_FILE.read_text(encoding="utf-8", errors="replace").strip()
@@ -1281,6 +1281,16 @@ def _load_knowledge():
     except Exception as e:
         log(f"知识读取失败: {str(e)[:80]}")
     return ""
+
+
+def _source_precedence_block():
+    """Return per-turn instructions that override stale persistent chat context."""
+    return """【回答来源优先级（必须遵守）】
+如果本轮附带了 knowledge.md，先逐项判断其中是否有与用户问题直接相关的信息；仅仅“知识库非空”不代表有相关信息。只要有相关信息，knowledge.md 就是唯一的事实来源；它与微信记忆、此前聊天内容、你的常识或网页信息冲突时，一律以 knowledge.md 为准。此时直接回答其中的结论，不要补充相冲突的经验性建议，也不要联网搜索。
+如果 knowledge.md 未附带，或其中没有相关信息，才可参考微信桥记忆；微信桥记忆是次级上下文，可能含有先前不准确的回答。
+只有这两处本地来源都没有相关信息时，才搜索网页后回答；不要把模型自身的泛化经验伪装成查证过的事实。回答时不必解释这套优先级，除非用户询问来源。
+
+"""
 
 
 def _append_memory(entry):
@@ -2813,16 +2823,18 @@ class Bridge:
             identity = BACKEND_IDENTITY.get(self.backend, "Codex")
             mem = _load_memory()
             memory_block = ("【微信桥记忆】\n" + mem + "\n\n") if mem else ""
-            knowledge = _load_knowledge() if text.strip().endswith(("?", "？")) else ""
+            # Knowledge is extra context for questions, including Chinese questions
+            # without a terminal question mark.  It remains the authoritative source
+            # whenever it contains a fact relevant to that question.
+            knowledge = _load_knowledge() if QUESTION_HINTS.search(text) else ""
             knowledge_block = (
-                "【知识库参考】\n"
-                "以下是本地 knowledge.md 的内容。回答用户问题时，优先参考其中"
-                "与问题相关的信息；如果没有相关内容，再按正常方式回答。不要声称"
-                "知识库中有不存在的内容。\n"
+                "【knowledge.md（最高优先级事实来源）】\n"
+                "以下是本地 knowledge.md 的可用内容。\n"
                 + knowledge + "\n\n"
             ) if knowledge else ""
             research_hint = _research_instruction(research_route) if research_route else ""
-            prompt = knowledge_block + memory_block + SYSTEM_HINT.format(identity=identity) + research_hint + text
+            prompt = (knowledge_block + memory_block + _source_precedence_block()
+                      + SYSTEM_HINT.format(identity=identity) + research_hint + text)
             base_prompt = PRIMER.format(identity=identity) if not sid else ""
             on_progress = self.send_weixin
             cfg = self.backend_cfg or {}

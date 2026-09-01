@@ -14,7 +14,7 @@
 - Notion long tasks: active; live resolver verified against the current weekly page
 - Notion week lookup: checks both the week-start and week-end month pages, including year-crossing weeks
 - Investigation completion records: active; successful reports are recorded in `ai/memo/knowledge.md`
-- Question knowledge lookup: active; messages ending in `?` or `？` use available knowledge as reference context
+- Question source precedence: active; question messages use `knowledge.md` as authoritative context, then WeChat memory, then web search
 - Diary capture: active; `diary`/`日记` entries are saved newest-first to `ai/memo/diary.md` and synchronized to the Notion diary page
 
 ## Layout
@@ -272,11 +272,23 @@ The keyword is a reserved bridge command: after a successful capture, that
 message is not sent to the normal Codex conversation or reminder flow. A
 keyword without any remaining content is rejected.
 
-For an incoming message whose final character is `?` or `？`, the bridge reads
-`ai/memo/knowledge.md` first when it contains content and gives that content to
-Codex as reference context. The answer prioritizes relevant knowledge entries;
-if there is no relevant entry, it answers normally. Knowledge context is capped
-at the most recent 16 KB to keep question handling bounded.
+For an incoming question, the bridge detects question wording rather than
+requiring a final `?` or `？`. It reads `ai/memo/knowledge.md` and passes it to
+Codex as additional context. The source order for a response is strict:
+
+1. A relevant `knowledge.md` entry is the authoritative fact source. It wins
+   over WeChat memory, prior conversation, model general knowledge, and web
+   results; the agent must not add conflicting advice or search online.
+2. If `knowledge.md` has no relevant information, the agent may use
+   `wechat-time/wechat_work/wechat_memory.md`. This is secondary context and
+   can contain earlier inaccurate answers.
+3. If neither local source has relevant information, the agent searches the
+   web before answering rather than presenting unverified model knowledge as a
+   researched fact.
+
+The bridge injects WeChat memory on every normal chat turn. Knowledge context
+is capped at the most recent 16 KB to keep question handling bounded. Restart
+`wechat-bridge.service` after changing this logic.
 
 ## Diary capture
 
