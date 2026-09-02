@@ -160,6 +160,7 @@ INBOX_DIR = Path(CODEX_WORK_DIR) / "inbox"
 MEMORY_FILE = Path(CODEX_WORK_DIR) / "wechat_memory.md"  # 每轮注入 + 对话后写回摘要
 MEMORY_MAX_ENTRIES = 30
 RESEARCH_ARCHIVE_DIR = REPO_ROOT / "ai" / "memo" / "investigation"
+AI_MEMO_DIR = REPO_ROOT / "ai" / "memo"
 KNOWLEDGE_FILE = REPO_ROOT / "ai" / "memo" / "knowledge.md"
 DIARY_FILE = REPO_ROOT / "ai" / "memo" / "diary.md"
 NOTION_DIARY_MANAGER_FILE = Path("/home/dedeanzheng/test_env/schduler/notion/notion_diary.py")
@@ -319,7 +320,10 @@ def classify_message(text):
 
 # ── 调研路由与报告归档 ───────────────────────────────────────────────
 
-_RESEARCH_HINTS = ("调研", "研究一下", "研究研究", "帮我研究", "做研究")
+_RESEARCH_HINTS = (
+    "调研", "研究一下", "研究研究", "帮我研究", "做研究",
+    "产出报告", "生成报告", "写报告", "做报告",
+)
 _XHS_SOURCE_RE = re.compile(r"小红书|红书|\bxhs\b", re.I)
 _RESEARCH_NOISE_RE = re.compile(
     r"(?:请|帮我|帮忙|麻烦|用|通过|在|一下|一下下|给我|关于|针对|做个|做一份|"
@@ -346,8 +350,9 @@ def _research_subject(text):
 
 def _research_instruction(route):
     """Per-turn source boundary; it must survive existing and resumed Codex sessions."""
-    common = """\n\n【本次调研报告要求】
+    common = f"""\n\n【本次调研报告要求】
 这是一次调研任务。完成研究后必须输出完整 Markdown 报告，不要只给聊天摘要；桥会把最终报告保存并作为 .md 文件发送。
+最终报告只能交给桥归档到 AI Memo 的 `{RESEARCH_ARCHIVE_DIR}`；不得在微信临时工作目录 `{CODEX_WORK_DIR}` 或其 `research/` 子目录创建最终报告。临时下载和中间文件可以留在工作目录，但最终成果不可以。
 研究过程中的进度可简短汇报，最终报告使用中文并按以下顺序：
 1. 结论先行
 2. 调研范围
@@ -384,6 +389,58 @@ def _save_research_report(text, request_text):
         return path
     except Exception as e:
         log(f"调研报告保存失败: {str(e)[:120]}")
+        return None
+
+
+def _report_body_from_reply(reply, file_paths=()):
+    """Prefer a Markdown report the agent created in its work directory over its chat summary."""
+    work_dir = Path(CODEX_WORK_DIR).resolve()
+    allowed_roots = (work_dir, RESEARCH_ARCHIVE_DIR.resolve(), AI_MEMO_DIR.resolve())
+    candidates = [str(p) for p in file_paths]
+    candidates += re.findall(r"`([^`\r\n]+\.md)`", reply or "")
+    candidates += re.findall(r"(?<![\w/])((?:[\w.-]+/)*research/[^\s`<>()[\]]+\.md)", reply or "")
+    for candidate in reversed(candidates):
+        source = Path(candidate).expanduser()
+        if not source.is_absolute():
+            source = work_dir / source
+        try:
+            source = source.resolve()
+            if not any(_is_relative_to(source, root) for root in allowed_roots):
+                continue
+            if source.is_file():
+                body = source.read_text(encoding="utf-8").strip()
+                if body:
+                    return body, source
+        except (OSError, UnicodeError, ValueError):
+            continue
+    return str(reply or "").strip(), None
+
+
+def _is_relative_to(path, root):
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _archive_temp_report_file(file_path, request_text):
+    """Move an agent-created temporary research Markdown file into the durable archive."""
+    source = Path(file_path).expanduser()
+    if not source.is_absolute():
+        source = Path(CODEX_WORK_DIR) / source
+    try:
+        source = source.resolve()
+        temp_research_dir = (Path(CODEX_WORK_DIR) / "research").resolve()
+        if source.suffix.lower() != ".md" or not source.is_file() or not _is_relative_to(source, temp_research_dir):
+            return None
+        archived = _save_research_report(source.read_text(encoding="utf-8"), request_text)
+        if archived:
+            source.unlink()
+            log(f"临时调研报告已归档并清理: {source} -> {archived}")
+        return archived
+    except (OSError, UnicodeError) as e:
+        log(f"临时调研报告归档失败: {str(e)[:120]}")
         return None
 
 
@@ -2779,9 +2836,12 @@ class Bridge:
                 with _active_turns_lock:
                     self._chat_active -= 1
 
-    def _deliver_research_report(self, report, request_text):
+    def _deliver_research_report(self, report, request_text, file_paths=()):
         """Persist the final research output and deliver it as the requested Markdown file."""
-        path = _save_research_report(report, request_text)
+        report_body, source = _report_body_from_reply(report, file_paths)
+        if source:
+            log(f"调研归档采用 Agent 生成的完整报告: {source}")
+        path = source if source and _is_relative_to(source, AI_MEMO_DIR.resolve()) else _save_research_report(report_body, request_text)
         if not path:
             return False
         try:
@@ -2852,17 +2912,21 @@ class Bridge:
                 self.state["session_account"] = self.account.get("account_id")
             if reply:
                 reply, files = _extract_files(reply)
-                for fp in files:
-                    p = Path(fp).expanduser()
-                    if not p.is_absolute():
-                        p = Path(CODEX_WORK_DIR) / p
-                    try:
-                        if not self.send_file(str(p)):
-                            self.send_weixin(f"文件发送失败：{fp}")
-                    except Exception as e:
-                        log(f"发送文件异常: {str(e)[:120]}")
-                        self.send_weixin(f"文件发送失败：{str(e)[:80]}")
-                report_sent = research_route and reply.strip() and self._deliver_research_report(reply, text)
+                report_sent = research_route and (reply.strip() or files) and self._deliver_research_report(reply, text, files)
+                if not research_route:
+                    for fp in files:
+                        p = Path(fp).expanduser()
+                        if not p.is_absolute():
+                            p = Path(CODEX_WORK_DIR) / p
+                        archived = _archive_temp_report_file(p, text)
+                        if archived:
+                            p = archived
+                        try:
+                            if not self.send_file(str(p)):
+                                self.send_weixin(f"文件发送失败：{fp}")
+                        except Exception as e:
+                            log(f"发送文件异常: {str(e)[:120]}")
+                            self.send_weixin(f"文件发送失败：{str(e)[:80]}")
                 if reply.strip() and not report_sent:
                     self.send_weixin(reply)
                     self._mark_replied(text)
@@ -2970,17 +3034,21 @@ class Bridge:
                 return
             if reply:
                 reply, files = _extract_files(reply)
-                for fp in files:
-                    p = Path(fp).expanduser()
-                    if not p.is_absolute():
-                        p = Path(CODEX_WORK_DIR) / p
-                    try:
-                        if not self.send_file(str(p)):
-                            self.send_weixin(f"文件发送失败：{fp}")
-                    except Exception as e:
-                        log(f"发送文件异常: {str(e)[:120]}")
-                        self.send_weixin(f"文件发送失败：{str(e)[:80]}")
-                report_sent = research_route and reply.strip() and self._deliver_research_report(reply, text)
+                report_sent = research_route and (reply.strip() or files) and self._deliver_research_report(reply, text, files)
+                if not research_route:
+                    for fp in files:
+                        p = Path(fp).expanduser()
+                        if not p.is_absolute():
+                            p = Path(CODEX_WORK_DIR) / p
+                        archived = _archive_temp_report_file(p, text)
+                        if archived:
+                            p = archived
+                        try:
+                            if not self.send_file(str(p)):
+                                self.send_weixin(f"文件发送失败：{fp}")
+                        except Exception as e:
+                            log(f"发送文件异常: {str(e)[:120]}")
+                            self.send_weixin(f"文件发送失败：{str(e)[:80]}")
                 if reply.strip() and not report_sent:
                     self.send_weixin(reply)
                     self._mark_replied(text)
