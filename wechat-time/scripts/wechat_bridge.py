@@ -1652,7 +1652,7 @@ def _append_knowledge(note):
             handle.write(str(note).strip() + "\n")
 
 
-_DIARY_RE = re.compile(r"(?<![A-Za-z])diary(?![A-Za-z])|日记", re.IGNORECASE)
+_DIARY_RE = re.compile(r"(?<![A-Za-z])(?:diary|ddd)(?![A-Za-z])|日记", re.IGNORECASE)
 
 
 def _extract_diary(text):
@@ -2602,7 +2602,7 @@ class Bridge:
         diary = _extract_diary(text)
         if diary is not None:
             if not diary:
-                self.send_weixin("请在 diary 或“日记”后写清楚要记录的想法。")
+                self.send_weixin("请在 diary、ddd 或“日记”后写清楚要记录的想法。")
                 return
             timestamp = datetime.now(timezone.utc)
             try:

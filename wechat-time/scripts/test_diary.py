@@ -22,9 +22,12 @@ class DiaryCaptureTests(unittest.TestCase):
 
     def test_extracts_english_and_chinese_keywords(self):
         self.assertEqual(wechat_bridge._extract_diary("diary 今天完成了部署"), "今天完成了部署")
+        self.assertEqual(wechat_bridge._extract_diary("ddd 今天完成了部署"), "今天完成了部署")
         self.assertEqual(wechat_bridge._extract_diary("日记：值得记下来"), "值得记下来")
         self.assertEqual(wechat_bridge._extract_diary("DIARY"), "")
+        self.assertEqual(wechat_bridge._extract_diary("DDD"), "")
         self.assertIsNone(wechat_bridge._extract_diary("普通聊天"))
+        self.assertIsNone(wechat_bridge._extract_diary("adddditional text"))
 
     def test_inserts_newest_entry_at_top_of_existing_date(self):
         self.diary_file.write_text(

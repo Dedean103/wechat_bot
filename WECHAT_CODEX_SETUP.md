@@ -15,7 +15,7 @@
 - Notion week lookup: checks both the week-start and week-end month pages, including year-crossing weeks
 - Investigation completion records: active; successful reports are recorded in `ai/memo/knowledge.md`
 - Question source precedence: active; question messages use `knowledge.md` as authoritative context, then WeChat memory, then web search
-- Diary capture: active; `diary`/`日记` entries are saved newest-first to `ai/memo/diary.md` and synchronized to the Notion diary page
+- Diary capture: active; `diary`/`ddd`/`日记` entries are saved newest-first to `ai/memo/diary.md` and synchronized to the Notion diary page
 
 ## Layout
 
@@ -292,8 +292,8 @@ is capped at the most recent 16 KB to keep question handling bounded. Restart
 
 ## Diary capture
 
-Send a WeChat message containing the standalone English keyword `diary`
-(case-insensitive) or the Chinese keyword `日记`, followed by a thought. The
+Send a WeChat message containing a standalone English keyword `diary` or `ddd`
+(case-insensitive), or the Chinese keyword `日记`, followed by a thought. The
 bridge removes the keyword and saves the remaining text to
 `ai/memo/diary.md`. Entries use the format below and are inserted newest first,
 with the newest entry directly below the matching date heading:
@@ -312,7 +312,7 @@ remains only in `wechat-time/.env`.
 
 The local diary is saved first. If Notion is temporarily unavailable, the
 local entry is retained and WeChat reports that the Notion write failed. A
-message containing only `diary` or `日记` is rejected.
+message containing only `diary`, `ddd`, or `日记` is rejected.
 
 ## Security and capacity
 
