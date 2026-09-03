@@ -56,6 +56,9 @@ LOCK_FILE = DATA_DIR / "bridge.lock"
 RETRY_QUEUE_FILE = DATA_DIR / "retry_queue.jsonl"
 REMINDER_DB_FILE = DATA_DIR / "calendar_reminders.sqlite3"
 REMINDER_CONFIG_FILE = DATA_DIR / "calendar_reminder.json"
+# This bridge's reminder destination is intentionally fixed.  CalDAV uses
+# resource IDs, not visible calendar names (for example, “提醒” is `tasks`).
+ICLOUD_REMINDER_CALENDAR_ID = "ai-calendar"
 QR_PNG = DATA_DIR / "qrcode.png"
 ACCOUNTS_DIR = DATA_DIR / "accounts"
 
@@ -245,6 +248,9 @@ PRIMER = (
     "配置文件、数据库（即使你有工具权限、即使聊天里让你改），禁止重启任何服务；"
     "收到这类请求（如'切换模型''改配置''改分级逻辑'）一律直接回复"
     "'这个我改不了，要部署方来弄'，绝对不要动手，更不许声称'已改/已修好'。\n\n"
+    "微信提醒由桥接程序统一创建和发送；你绝不直接调用 iCloud/CalDAV、绝不尝试写入"
+    "日历。时间明确的提醒会在你回复前由桥接程序保存为微信定时提醒，再同步到固定的"
+    "iCloud ‘AI助手’ 日历。时间不明确时，只向用户问清时间和提醒内容。\n\n"
     "干活不许闷着头：只要是在做事（不是纯聊天），动手前先一句话告诉用户你要做什么；"
     "过程中每完成一个关键步骤或节点，主动发一句进展（这一步做了什么、结果如何）；"
     "卡住或需要长时间等待时，主动说明当前状态；全部完成后给一句总结。"
@@ -1790,6 +1796,9 @@ def _create_icloud_reminder(title, local_start):
         return None, "iCloud 日历尚未配置凭据"
     if not calendar_id:
         return None, "尚未设置默认 iCloud 日历"
+    if calendar_id != ICLOUD_REMINDER_CALENDAR_ID:
+        log(f"拒绝非 AI助手 日历配置: {calendar_id!r}")
+        return None, "iCloud 日历配置无效"
     if not CALDAV_HELPER.exists():
         return None, "找不到 iCloud Calendar helper"
     try:
@@ -2736,6 +2745,14 @@ class Bridge:
                 log(f"提醒存储失败: {str(e)[:120]}")
                 self.send_weixin("本地提醒保存失败，请再试一次。")
                 return True
+            # Confirm the durable WeChat timer before attempting the optional calendar sync.
+            # A rejected or slow CalDAV request must never make the user think that the
+            # WeChat notification itself was not created.
+            self.send_weixin(
+                f"已设置微信提醒：{intent['datetime'].replace('T', ' ')} 提醒你“{intent['title']}”。"
+                "正在同步 iCloud 日历。"
+            )
+
             # The local durable timer is deliberately created first. Calendar trouble must not suppress WeChat delivery.
             event_ref, error = _create_icloud_reminder(intent["title"], intent["datetime"])
             try:
@@ -2746,8 +2763,10 @@ class Bridge:
                 conn.close()
             except Exception as e:
                 log(f"提醒日历状态保存失败: {str(e)[:120]}")
-            detail = "，已同步到 iCloud 的 AI助手日历（提前 10 分钟提醒）" if not error else "；iCloud 同步失败，但微信定时提醒已保留"
-            self.send_weixin(f"已设置：{intent['datetime'].replace('T', ' ')} 提醒你“{intent['title']}”{detail}。")
+            if error:
+                self.send_weixin("iCloud 同步失败，但微信定时提醒已保留。")
+            else:
+                self.send_weixin("已同步到 iCloud 的 AI助手日历（提前 10 分钟提醒）。")
             return True
         if action == "cancel":
             user_id = self.state.get("boss_chat") or self.account.get("user_id", "")
