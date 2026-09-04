@@ -55,6 +55,14 @@ class DiaryCaptureTests(unittest.TestCase):
         wechat_bridge._append_diary_notion("same thought", timestamp, "diary-page")
         manager.append_message.assert_called_once_with("same thought", timestamp)
 
+    def test_reminder_prompt_uses_next_future_occurrence_for_ambiguous_hours(self):
+        prompt = wechat_bridge.REMINDER_INTERPRETER_PROMPT.format(
+            timezone="Asia/Shanghai", now="2026-09-04 13:00:00"
+        )
+        self.assertIn("今天 14:00", prompt)
+        self.assertIn("明天 02:00", prompt)
+        self.assertIn("最近的那个未来时间", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

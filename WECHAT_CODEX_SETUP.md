@@ -14,6 +14,7 @@
 - Notion long tasks: active; live resolver verified against the current weekly page
 - Notion week lookup: checks both the week-start and week-end month pages, including year-crossing weeks
 - Investigation completion records: active; successful reports are recorded in `ai/memo/knowledge.md`
+- Research-report archival guard: active; final reports are stored in AI Memo, never retained in `wechat_work/research/`
 - Question source precedence: active; question messages use `knowledge.md` as authoritative context, then WeChat memory, then web search
 - Diary capture: active; `diary`/`ddd`/`日记` entries are saved newest-first to `ai/memo/diary.md` and synchronized to the Notion diary page
 
@@ -135,13 +136,16 @@ The threshold was increased from 100 after one reply arrived as three messages.
 
 ## Research requests and reports
 
-The bridge routes research requests by the source explicitly named by the user:
+The bridge routes research and report-producing requests by the source explicitly named by the user:
 
 - `帮我调研一下…` (without 小红书/XHS/红书) uses normal web research only.
   It must not invoke any 小红书 skill, MCP tool, or source.
 - `用小红书帮我调研一下…`, or another research request that explicitly names
   小红书/XHS/红书, uses the installed `xhs-research` / 小红书 skill flow. The
   skill checks MCP availability and login before researching.
+- Requests such as `分析一下…并产出报告`, `生成报告`, `写报告`, and `做报告`
+  use the same durable report-archive flow even when they do not literally
+  contain `调研` or `研究`.
 
 For either route, the bridge immediately replies exactly:
 
@@ -166,7 +170,14 @@ YYMMDD-<subject>.md
 For example, on 2026-08-29: `260829-显示器支架.md`. A repeated same-subject
 report is preserved with `-2`, `-3`, and so on; it never overwrites an earlier
 report. The legacy `wechat_work/research/` directory is no longer used for new
-reports.
+reports. `wechat_work/` is strictly a temporary agent-work area for memory,
+received files, and disposable intermediate artifacts.
+
+As a defensive fallback, if an agent still creates a Markdown report under
+`wechat_work/research/`, the bridge copies its full content into
+`ai/memo/investigation/`, sends the archived copy, and removes the temporary
+file. This prevents a short final chat message such as
+`报告已生成：research/example.md` from being mistakenly saved as the report.
 
 After a report is successfully saved, the bridge appends a completion record to
 `ai/memo/knowledge.md` in the form
@@ -192,15 +203,22 @@ delivery, retries, and cancellation are ordinary bridge code. When Codex can
 resolve a future time and task, the bridge immediately:
 
 1. stores a durable WeChat reminder in
-   `scripts/weixin_bridge/calendar_reminders.sqlite3`;
-2. creates a 30-minute iCloud Calendar event with a **10-minute display alarm**;
+   `scripts/weixin_bridge/calendar_reminders.sqlite3` and immediately confirms
+   it in WeChat;
+2. then attempts to create a 30-minute iCloud Calendar event with a **10-minute
+   display alarm**;
 3. sends `⏰ 提醒：…` at the event start time. The scheduler runs inside the
    systemd bridge and sends overdue reminders after a restart.
 
-Time is interpreted as `Asia/Shanghai`. The local timer is saved first: an
-iCloud failure is recorded but never prevents the WeChat reminder. An immediate
-natural-language cancellation is interpreted by Codex, then cancelled by code
-locally and, when available, in iCloud.
+Time is interpreted as `Asia/Shanghai`. The local timer is saved and confirmed
+first: an iCloud failure is recorded but never prevents the WeChat reminder.
+When a time is given without an AM/PM qualifier, the bridge uses the next
+future occurrence in that timezone: for example, “两点提醒我……” at 13:00
+means 14:00 the same day, while at 23:00 it means 02:00 the next day.
+The configured calendar must be a CalDAV resource ID (for example `ai-calendar`),
+not a visible calendar name such as `提醒`. An immediate natural-language
+cancellation is interpreted by Codex, then cancelled by code locally and, when
+available, in iCloud.
 
 ### One-time iCloud configuration
 
@@ -216,7 +234,9 @@ cd /home/dedeanzheng/.codex/skills/caldav-icloud
 ./caldav.sh calendars
 ```
 
-The existing `AI助手` calendar has ID `ai-calendar`. Its non-secret bridge configuration is at
+The bridge is intentionally pinned to the existing `AI助手` calendar, whose
+CalDAV resource ID is `ai-calendar`; it rejects any other configured value. Its
+non-secret bridge configuration is at
 `wechat-time/scripts/weixin_bridge/calendar_reminder.json`:
 
 ```json
