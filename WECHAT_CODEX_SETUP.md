@@ -16,6 +16,7 @@
 - Investigation completion records: active; successful reports are recorded in `ai/memo/knowledge.md`
 - Research-report archival guard: active; final reports are stored in AI Memo, never retained in `wechat_work/research/`
 - Question source precedence: active; question messages use `knowledge.md` as authoritative context, then WeChat memory, then web search
+- Knowledge recall: active; records are numbered and list-style questions scan the complete `knowledge.md` store
 - Diary capture: active; `diary`/`ddd`/`日记` entries are saved newest-first to `ai/memo/diary.md` and synchronized to the Notion diary page
 
 ## Layout
@@ -90,6 +91,34 @@ base for durable AI data. Therefore research reports are saved to
 `/home/dedeanzheng/memo/wechat-time/wechat_work/` for temporary work, memory,
 and received inbox files; it is not the archive location for new research
 reports.
+
+## Knowledge store recall
+
+The durable Markdown knowledge store is
+`/home/dedeanzheng/memo/ai/memo/knowledge.md`. It is loaded for questions,
+list-style requests, and requests that explicitly mention the knowledge store,
+`knowledge`, or `MDS`.
+
+The bridge presents blank-line-separated notes as numbered knowledge records.
+For requests containing words such as `哪些`, `有哪些`, `全部`, `所有`, `列出`,
+or `分别`, the prompt requires an exhaustive scan from the first record through
+the last record and requires every directly relevant record to be covered. The
+bridge no longer drops the beginning of the file with a fixed tail-only limit.
+Research requests that explicitly require web or 小红书 sources remain on their
+research source route and do not receive the knowledge store as a competing
+source.
+
+Useful local checks after changing the bridge:
+
+```bash
+cd /home/dedeanzheng/memo
+python3 -m py_compile wechat-time/scripts/wechat_bridge.py
+python3 wechat-time/scripts/test_diary.py
+```
+
+The regression scenario is `日本有哪些清酒店？`. Its answer context must retain
+the Kurashiki, Tokyo/Yokohama, Kyoto, and Obuse-related records from
+`knowledge.md`, rather than returning only a representative subset.
 
 ## Service operations
 

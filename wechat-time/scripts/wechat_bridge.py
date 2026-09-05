@@ -297,6 +297,12 @@ QUESTION_HINTS = re.compile(
     r"可不可以|行不行|什么|怎么|为什么|哪个|几点|多少|如何|多久"
 )
 
+# Requests using these words are asking for a complete set, not a few examples.
+KNOWLEDGE_EXHAUSTIVE_HINTS = (
+    "有哪些", "哪一些", "哪些", "全部", "所有", "每个", "逐个", "分别",
+    "列出", "完整", "都有什么", "相关的都",
+)
+
 # 纯确认/问候短词：整条消息命中即 casual（秒回、低推理省 token）
 CASUAL_PHRASES = (
     "好的", "好", "可以", "没问题", "收到", "谢谢", "嗯", "嗯嗯", "行",
@@ -1338,13 +1344,49 @@ def _load_knowledge():
     """读取持久化知识，作为问题消息的最高优先级事实来源。"""
     try:
         if KNOWLEDGE_FILE.exists():
-            text = KNOWLEDGE_FILE.read_text(encoding="utf-8", errors="replace").strip()
-            if len(text) > 16000:
-                text = "（较早内容已省略，仅保留最近的知识记录）\n" + text[-16000:]
-            return text
+            return KNOWLEDGE_FILE.read_text(encoding="utf-8", errors="replace").strip()
     except Exception as e:
         log(f"知识读取失败: {str(e)[:80]}")
     return ""
+
+
+def _knowledge_prompt(text):
+    """Build a clearly delimited, exhaustive knowledge context for a user turn."""
+    knowledge = _load_knowledge()
+    if not knowledge:
+        return ""
+
+    # Blank-line separated notes are the current Markdown store's record format.
+    # Numbering them makes it harder for the model to treat the file as one
+    # continuous passage and accidentally stop after the first useful paragraph.
+    records = [part.strip() for part in re.split(r"\n\s*\n+", knowledge) if part.strip()]
+    formatted = "\n\n".join(
+        f"【知识记录 {index}】\n{record}" for index, record in enumerate(records, 1)
+    )
+    exhaustive = any(hint in str(text or "") for hint in KNOWLEDGE_EXHAUSTIVE_HINTS)
+    mode = (
+        "这是一个穷举问题。必须从知识记录 1 扫描到最后一条，返回所有直接相关记录；"
+        "不能只挑几条代表项，也不能因为某条较早或较短就省略。"
+        if exhaustive else
+        "请逐条检查全部知识记录，回答中包含所有与问题直接相关的记录。"
+    )
+    return (
+        "【knowledge.md（最高优先级事实来源）】\n"
+        "以下是本地 knowledge.md 的完整内容，空行分隔的内容是独立知识记录。\n"
+        f"{mode}\n"
+        "如果记录没有相关内容，不要编造；如果有多条相关记录，请合并但逐条覆盖。\n"
+        + formatted + "\n\n"
+    )
+
+
+def _should_attach_knowledge(text):
+    """Attach the store for questions, list requests, or explicit store requests."""
+    raw = str(text or "")
+    return (
+        bool(QUESTION_HINTS.search(raw))
+        or any(hint in raw for hint in KNOWLEDGE_EXHAUSTIVE_HINTS)
+        or bool(re.search(r"knowledge|知识库|MDS", raw, re.IGNORECASE))
+    )
 
 
 def _source_precedence_block():
@@ -2903,15 +2945,9 @@ class Bridge:
             identity = BACKEND_IDENTITY.get(self.backend, "Codex")
             mem = _load_memory()
             memory_block = ("【微信桥记忆】\n" + mem + "\n\n") if mem else ""
-            # Knowledge is extra context for questions, including Chinese questions
-            # without a terminal question mark.  It remains the authoritative source
-            # whenever it contains a fact relevant to that question.
-            knowledge = _load_knowledge() if QUESTION_HINTS.search(text) else ""
-            knowledge_block = (
-                "【knowledge.md（最高优先级事实来源）】\n"
-                "以下是本地 knowledge.md 的可用内容。\n"
-                + knowledge + "\n\n"
-            ) if knowledge else ""
+            # Knowledge is attached to questions, including Chinese questions without
+            # a terminal question mark, with an explicit exhaustive-scan protocol.
+            knowledge_block = _knowledge_prompt(text) if _should_attach_knowledge(text) else ""
             research_hint = _research_instruction(research_route) if research_route else ""
             prompt = (knowledge_block + memory_block + _source_precedence_block()
                       + SYSTEM_HINT.format(identity=identity) + research_hint + text)
@@ -3002,6 +3038,7 @@ class Bridge:
             identity = BACKEND_IDENTITY.get(self.backend, "Codex")
             mem = _load_memory()
             memory_block = ("【微信桥记忆】\n" + mem + "\n\n") if mem else ""
+            knowledge_block = _knowledge_prompt(text) if _should_attach_knowledge(text) else ""
             if resume_sid:
                 prompt = ("继续执行刚才被打断的任务，从断点接着做，完成后按协议汇报。任务内容：\n" + text)
                 base_prompt = ""
@@ -3011,9 +3048,10 @@ class Bridge:
                 base_prompt = PRIMER.format(identity=identity)
                 sid = None
             if self.backend == "codex":
-                prompt = memory_block + SYSTEM_HINT.format(identity=identity) + prompt
+                prompt = (knowledge_block + memory_block + _source_precedence_block()
+                          + SYSTEM_HINT.format(identity=identity) + prompt)
             else:
-                prompt = memory_block + prompt
+                prompt = knowledge_block + memory_block + _source_precedence_block() + prompt
             if research_route:
                 prompt += _research_instruction(research_route)
             prompt += TASK_PROTOCOL
