@@ -133,6 +133,35 @@ The service runs as user `dedeanzheng` with working directory
 `/home/dedeanzheng/memo/wechat-time/` and `Restart=always`.
 Do not run a foreground bridge while systemd is running.
 
+### Reloading Codex and MCP after a tool or skill fix
+
+The bridge keeps a Codex app-server and WebSocket helper running between
+messages. A WeChat conversation can therefore retain an older Codex thread,
+while the long-lived app-server may also retain the MCP tool discovery state
+from when it started. If the Xiaohongshu MCP was repaired or its skill was
+updated while the bridge was already running, use this sequence:
+
+```bash
+sudo systemctl restart wechat-bridge.service
+sudo systemctl is-active wechat-bridge.service
+sudo journalctl -u wechat-bridge.service -n 30 --no-pager
+```
+
+After the service reports `active` and the journal shows `Codex app-server`
+and `Codex 常驻连接就绪`, send `新任务` (or `/new`) through WeChat. This clears
+the old Codex conversation thread without deleting cookies or changing the
+Xiaohongshu service. Then run a small read-only test such as:
+
+```text
+检查小红书 MCP 登录状态，然后搜索人体工学椅
+```
+
+The test must reach `check_login_status` and then a read-only search. Do not
+delete Xiaohongshu cookies or restart the Xiaohongshu backend unless a direct
+MCP tool call fails. A shell `curl`/`ss`/`ps` check from a restricted sandbox
+cannot override a successful MCP tool call because it may not share the
+host's loopback or process namespace.
+
 ## Validation
 
 ```bash
