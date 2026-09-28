@@ -217,12 +217,15 @@ preferred research presentation: conclusion first, scope, comparison table,
 key evidence/cost or configuration breakdown, risks, recommendation,
 limitations, and sources (小红书 reports label their sources as `参考笔记`).
 
-The bridge saves the final report only in `ai/memo/investigation/` and sends
-that same file back through WeChat. Names use China-local date and a safe
-subject slug:
+The bridge saves the Markdown original in `ai/memo/investigation/`, creates a
+TXT sibling with byte-for-byte identical content, and sends the TXT file (not
+the Markdown) back through WeChat. It also sends a standalone, approximately
+50–100 Chinese-character conclusion summary as a WeChat message before the
+file. Names use China-local date and a safe subject slug:
 
 ```text
 YYMMDD-<subject>.md
+YYMMDD-<subject>.txt
 ```
 
 For example, on 2026-08-29: `260829-显示器支架.md`. A repeated same-subject
@@ -233,7 +236,7 @@ received files, and disposable intermediate artifacts.
 
 As a defensive fallback, if an agent still creates a Markdown report under
 `wechat_work/research/`, the bridge copies its full content into
-`ai/memo/investigation/`, sends the archived copy, and removes the temporary
+`ai/memo/investigation/`, creates and sends its TXT copy, and removes the temporary
 file. This prevents a short final chat message such as
 `报告已生成：research/example.md` from being mistakenly saved as the report.
 
@@ -273,7 +276,7 @@ first: an iCloud failure is recorded but never prevents the WeChat reminder.
 When a time is given without an AM/PM qualifier, the bridge uses the next
 future occurrence in that timezone: for example, “两点提醒我……” at 13:00
 means 14:00 the same day, while at 23:00 it means 02:00 the next day.
-The configured calendar must be a CalDAV resource ID (for example `ai-calendar`),
+The configured calendar must be a CalDAV short resource ID (for example `ai-calendar`),
 not a visible calendar name such as `提醒`. An immediate natural-language
 cancellation is interpreted by Codex, then cancelled by code locally and, when
 available, in iCloud.
@@ -293,7 +296,10 @@ cd /home/dedeanzheng/.codex/skills/caldav-icloud
 ```
 
 The bridge is intentionally pinned to the existing `AI助手` calendar, whose
-CalDAV resource ID is `ai-calendar`; it rejects any other configured value. Its
+CalDAV short resource ID is `ai-calendar`; it rejects any other configured value. Do
+not use the full discovered CalDAV path (for example
+`/1417047934/calendars/ai-calendar/`), because the helper prepends the calendar base
+path itself. Its
 non-secret bridge configuration is at
 `wechat-time/scripts/weixin_bridge/calendar_reminder.json`:
 

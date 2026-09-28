@@ -57,7 +57,7 @@ RETRY_QUEUE_FILE = DATA_DIR / "retry_queue.jsonl"
 REMINDER_DB_FILE = DATA_DIR / "calendar_reminders.sqlite3"
 REMINDER_CONFIG_FILE = DATA_DIR / "calendar_reminder.json"
 # This bridge's reminder destination is intentionally fixed.  CalDAV uses
-# resource IDs, not visible calendar names (for example, “提醒” is `tasks`).
+# resource IDs, not visible calendar names (the “AI助手” calendar is `ai-calendar`).
 ICLOUD_REMINDER_CALENDAR_ID = "ai-calendar"
 QR_PNG = DATA_DIR / "qrcode.png"
 ACCOUNTS_DIR = DATA_DIR / "accounts"
@@ -185,6 +185,7 @@ SEND_RATE_WINDOW = 60              # 限流窗口秒数
 MAX_MSG_LEN = 1000                 # 单条微信消息长度上限：代码块等整体单元的硬切上限
 SPLIT_TARGET = 600                 # 普通文本切片目标：回复超 600 字才按句子切片，减少条数
 MAX_REPLY_PARTS = 5                # 单次回复最多发5条：iLink 对单条入站消息回复有约10条硬限制，超出会被吞
+FINGERPRINT_TTL_S = 2 * 60         # 无消息 ID 时仅短期按内容去重
 POLL_TIMEOUT = 45                  # getupdates 长轮询默认超时秒数（跟随服务端 longpolling_timeout_ms 调整）
 REMINDER_POLL_INTERVAL = 5         # 到期提醒检查频率；状态保存在 SQLite，重启不会丢
 REMINDER_TIMEZONE = "Asia/Shanghai"
@@ -239,16 +240,26 @@ SYSTEM_HINT = ("你是{identity}，正在微信里和用户私聊。像日常聊
                "能用一句话说清绝不多写，长内容只挑重点；只讲结论和必要细节，"
                "删掉客套、过程描述和无关铺垫。用户的消息：\n")
 
+PERMISSION_POLICY_VERSION = 2
+PERMISSION_POLICY = (
+    "【读取与修改权限】你可读取本机当前账号有权访问的文件来完成用户任务；"
+    "读取本身不需要另行确认。不要把凭据、令牌或私密文件内容发到聊天或外部服务，除非用户明确要求。"
+    "用户要求的普通、可撤销文件修改可以直接完成。"
+    "修改系统或服务配置、定时任务、机器人自身代码或配置、数据库结构或大量记录，"
+    "以及删除重要数据、重启或停止服务前，必须获得用户对该具体操作的明确授权。"
+    "用户在当前或此前对话中已明确授权的，不要重复索取授权；先完成必要的只读检查和准备，"
+    "再执行获授权的操作并报告结果。没有授权时，说明拟做的具体改动并询问一次。"
+    "不要把一次授权扩大到其他敏感操作。若实际工具或系统权限不足，说明真实错误，"
+    "不要把它说成永久禁止，也不要声称已完成。\n\n"
+)
+
 PRIMER = (
     "【本体底稿】你是 {identity}，微信主人是李白。你走的是李白开的微信专线，这个微信 bot 只服务扫码绑定的那个用户。"
-    "你和用户在微信私聊，消息直达你的本体会话，不走任何群。你跑在用户的电脑上。"
+    "你和用户在微信私聊，消息直达你的本体会话，不走任何群。你跑在用户的 VPS 上。"
     "用户说话直接，不喜欢废话和客套。你是 AI 不是真人：做不到的事（发文件、发邮箱、打电话、"
-    "线下操作）一律不许假装能做，直接说实话。你有完整工具权限，用户让干的活直接干，"
+    "线下操作）一律不许假装能做，直接说实话。按实际工具权限和用户授权做事，"
     "干完把结果简洁地告诉用户。\n\n"
-    "你的模型、配置和代码由部署方统一维护。你绝对禁止修改任何代码文件、脚本、"
-    "配置文件、数据库（即使你有工具权限、即使聊天里让你改），禁止重启任何服务；"
-    "收到这类请求（如'切换模型''改配置''改分级逻辑'）一律直接回复"
-    "'这个我改不了，要部署方来弄'，绝对不要动手，更不许声称'已改/已修好'。\n\n"
+    + PERMISSION_POLICY +
     "微信提醒由桥接程序统一创建和发送；你绝不直接调用 iCloud/CalDAV、绝不尝试写入"
     "日历。时间明确的提醒会在你回复前由桥接程序保存为微信定时提醒，再同步到固定的"
     "iCloud ‘AI助手’ 日历。时间不明确时，只向用户问清时间和提醒内容。\n\n"
@@ -258,8 +269,8 @@ PRIMER = (
     "宁可多报不可少报，绝不长时间无声无息。\n"
     "回复一律精简：微信里说话简短直接、先结论后细节，长内容拆成几条短消息分开发，"
     "绝不把一大段文字堆在一起。\n\n"
-    "遇到复杂任务（大型开发、系统级改动、长流程工程）不要硬扛："
-    "明确告诉用户'这个任务交给更强的桌面 Agent 更稳'，简要说明已做进度和关键上下文，由部署方转交。\n\n"
+    "遇到复杂任务（大型开发、系统级改动、长流程工程），先做能完成的检查和准备；"
+    "确实受工具、权限或能力限制时，说明限制和已有进度。\n\n"
 )
 
 
@@ -364,7 +375,7 @@ def _research_subject(text):
 def _research_instruction(route):
     """Per-turn source boundary; it must survive existing and resumed Codex sessions."""
     common = f"""\n\n【本次调研报告要求】
-这是一次调研任务。完成研究后必须输出完整 Markdown 报告，不要只给聊天摘要；桥会把最终报告保存并作为 .md 文件发送。
+这是一次调研任务。完成研究后必须输出完整 Markdown 报告，不要只给聊天摘要；桥会把最终报告保存为 .md，并生成内容完全相同的 .txt 文件发送到微信。
 最终报告只能交给桥归档到 AI Memo 的 `{RESEARCH_ARCHIVE_DIR}`；不得在微信临时工作目录 `{CODEX_WORK_DIR}` 或其 `research/` 子目录创建最终报告。临时下载和中间文件可以留在工作目录，但最终成果不可以。
 研究过程中的进度可简短汇报，最终报告使用中文并按以下顺序：
 1. 结论先行
@@ -376,6 +387,12 @@ def _research_instruction(route):
 7. 局限性
 8. 参考来源
 允许使用 Markdown 标题、表格和可点击链接；这条报告格式要求优先于微信的简短聊天偏好。
+
+在完整报告前，必须另起两行严格输出以下结构（摘要不属于 Markdown 报告正文）：
+【微信调研摘要】
+用 50–100 个中文字符写出可独立阅读的结论摘要：回答推荐/不推荐什么、最重要的依据、适用条件和关键风险；不要用“详见报告”等代指。
+【报告正文】
+随后输出完整 Markdown 报告。桥只会把“报告正文”归档到本地 Markdown/TXT 文件，并将摘要作为微信文字消息发送。
 """
     if route == "xhs":
         return common + """【来源路由：小红书】
@@ -405,8 +422,47 @@ def _save_research_report(text, request_text):
         return None
 
 
+_RESEARCH_SUMMARY_RE = re.compile(
+    r"【微信调研摘要】\s*(.*?)\s*【报告正文】\s*", re.S)
+
+
+def _split_research_reply(reply):
+    """Return the optional WeChat summary and the Markdown-only report body."""
+    text = str(reply or "").strip()
+    match = _RESEARCH_SUMMARY_RE.search(text)
+    if not match:
+        return "", text
+    summary = match.group(1).strip()
+    body = (text[:match.start()] + text[match.end():]).strip()
+    return summary, body
+
+
+def _fallback_research_summary(report_body):
+    """Produce a readable conclusion when an older agent misses the summary marker."""
+    text = str(report_body or "")
+    conclusion = re.split(r"\n\s*#{1,3}\s*(?:调研范围|方案对比|关键依据|成本|配置|潜在短板|综合建议|局限性|参考来源|参考笔记)", text, maxsplit=1)[0]
+    conclusion = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", conclusion)
+    conclusion = re.sub(r"[`#>*_|]", "", conclusion)
+    conclusion = re.sub(r"\s+", " ", conclusion).strip()
+    # A safe excerpt is preferable to padding a thin report with invented claims.
+    return conclusion[:100] or "调研报告已完成，请查看随附的 TXT 文件。"
+
+
+def _save_research_text_copy(markdown_path):
+    """Create the WeChat-readable TXT sibling with exactly the Markdown file bytes."""
+    try:
+        markdown_path = Path(markdown_path)
+        txt_path = markdown_path.with_suffix(".txt")
+        shutil.copyfile(markdown_path, txt_path)
+        return txt_path
+    except (OSError, shutil.Error) as e:
+        log(f"调研 TXT 副本保存失败: {str(e)[:120]}")
+        return None
+
+
 def _report_body_from_reply(reply, file_paths=()):
     """Prefer a Markdown report the agent created in its work directory over its chat summary."""
+    _, reply = _split_research_reply(reply)
     work_dir = Path(CODEX_WORK_DIR).resolve()
     allowed_roots = (work_dir, RESEARCH_ARCHIVE_DIR.resolve(), AI_MEMO_DIR.resolve())
     candidates = [str(p) for p in file_paths]
@@ -2305,12 +2361,16 @@ class Bridge:
             log("⚠️ 账号缺少 user_id：已进入拒收模式（fail-closed），请重新扫码注册")
         self.state = {"sync_buf": "", "context_token": "", "boss_chat": "",
                       "codex_session": None, "session_account": "", "seen": [],
-                      "seen_fps": [], "sessions": []}
+                      "seen_fps": {}, "sessions": []}
         if STATE_FILE.exists():
             try:
                 self.state.update(json.loads(STATE_FILE.read_text(encoding="utf-8-sig")))
             except Exception:
                 pass
+        # v2.1 stores fingerprint timestamps.  Earlier versions stored a bare
+        # list, which had no expiry and could incorrectly suppress a message
+        # repeated days later; legacy entries are therefore intentionally dropped.
+        self._prune_seen_fps()
         self.reply_q = deque()
         self._q_cond = threading.Condition()
         self.task_q = deque()          # 后台任务队列（FIFO 顺序执行）
@@ -2345,6 +2405,15 @@ class Bridge:
         self._poll_timeout = POLL_TIMEOUT
         self._account_mtime = ACCOUNT_FILE.stat().st_mtime if ACCOUNT_FILE.exists() else 0.0
         self.backend, self.backend_cfg = _load_backend()
+        if self.backend == "codex" and self.state.get("permission_policy_version") != PERMISSION_POLICY_VERSION:
+            # Older threads retain the former blanket refusal in their base instructions.
+            # Preserve their IDs for diagnostics, but start fresh under the new policy.
+            self.state["legacy_sessions"] = self.state.get("sessions") or []
+            self.state["sessions"] = []
+            self.state["codex_session"] = None
+            self.state["permission_policy_version"] = PERMISSION_POLICY_VERSION
+            log("🔄 权限规则已更新，下一条微信消息将开启新 Codex 会话")
+            self.save_state()
         # 当前主账号进池，作为后续备用
         self._persist_account_state(self.account, self.state)
         self._cleanup_stale_session()
@@ -2365,6 +2434,29 @@ class Bridge:
             tmp.write_text(json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8")
             os.replace(tmp, STATE_FILE)
             self._persist_account_state(self.account, self.state)
+
+    def _prune_seen_fps(self, now=None):
+        """Keep only recent content fingerprints for updates without message IDs."""
+        now = time.time() if now is None else now
+        seen_fps = self.state.get("seen_fps", {})
+        if not isinstance(seen_fps, dict):
+            self.state["seen_fps"] = {}
+            return
+        cutoff = now - FINGERPRINT_TTL_S
+        self.state["seen_fps"] = {
+            fp: ts for fp, ts in seen_fps.items()
+            if isinstance(ts, (int, float)) and cutoff <= ts <= now
+        }
+
+    def _is_duplicate_content(self, fp, now=None):
+        """Record a fingerprint and return whether it was recently seen."""
+        now = time.time() if now is None else now
+        self._prune_seen_fps(now)
+        seen_fps = self.state["seen_fps"]
+        if fp in seen_fps:
+            return True
+        seen_fps[fp] = now
+        return False
 
     def _mark_replied(self, text):
         """记录已成功回复的入站消息指纹，重启补回队列时跳过，防止重复回复。"""
@@ -2581,13 +2673,11 @@ class Bridge:
             text += "\n\n[用户这次发来的文件]\n" + "\n".join(f"- {Path(a).name} -> {a}" for a in attachments)
         self.state["boss_chat"] = from_user
         log(f"📩 微信[{from_user[:14]}…]: {text[:60]}")
-        fp = hashlib.md5((from_user + "|" + text).encode("utf-8")).hexdigest()
-        seen_fps = self.state.setdefault("seen_fps", [])
-        if fp in seen_fps:
-            log("♻️ 内容指纹去重，跳过重复消息")
-            return
-        seen_fps.append(fp)
-        self.state["seen_fps"] = seen_fps[-50:]
+        if not msg_id:
+            fp = hashlib.md5((from_user + "|" + text).encode("utf-8")).hexdigest()
+            if self._is_duplicate_content(fp):
+                log("♻️ 无消息 ID，短期内容指纹去重，跳过重复消息")
+                return
         norm = _norm_msg(text)
         raw = text.strip()
         if norm in STOP_PHRASES:
@@ -2899,13 +2989,16 @@ class Bridge:
                     self._chat_active -= 1
 
     def _deliver_research_report(self, report, request_text, file_paths=()):
-        """Persist the final research output and deliver it as the requested Markdown file."""
+        """Archive Markdown, then deliver its identical TXT copy plus a conclusion summary."""
+        requested_summary, _ = _split_research_reply(report)
         report_body, source = _report_body_from_reply(report, file_paths)
         if source:
             log(f"调研归档采用 Agent 生成的完整报告: {source}")
         path = source if source and _is_relative_to(source, AI_MEMO_DIR.resolve()) else _save_research_report(report_body, request_text)
         if not path:
             return False
+        txt_path = _save_research_text_copy(path)
+        summary = requested_summary or _fallback_research_summary(report_body)
         try:
             title = _research_subject(request_text)
             _append_knowledge(f"{title} completed, reported {path.name}")
@@ -2913,14 +3006,18 @@ class Bridge:
             # Report delivery must still succeed if the optional knowledge update fails.
             log(f"调研完成记录写入知识库失败: {str(e)[:120]}")
         try:
-            if self.send_file(str(path)):
-                self.send_weixin(f"调研完成，报告已生成并发送：{path.name}")
-                return True
-            self.send_weixin(f"报告已保存为 {path.name}，但发送文件失败；下面附上正文。")
+            self.send_weixin(summary)
+            if txt_path and self.send_file(str(txt_path)):
+                self.send_weixin(f"调研完成：已发送可在微信打开的 {txt_path.name}；Markdown 原件保存在本机：{path.name}")
+            elif txt_path:
+                self.send_weixin(f"Markdown 原件已保存为 {path.name}，但 TXT 文件发送失败。")
+            else:
+                self.send_weixin(f"Markdown 原件已保存为 {path.name}，但 TXT 副本创建失败。")
         except Exception as e:
-            log(f"调研报告发送异常: {str(e)[:120]}")
-            self.send_weixin(f"报告已保存为 {path.name}，但发送文件失败；下面附上正文。")
-        return False
+            log(f"调研结果发送异常: {str(e)[:120]}")
+            self.send_weixin(f"Markdown 原件已保存为 {path.name}，但微信摘要或 TXT 发送失败。")
+        # Do not fall through to sending the full Markdown reply as chat text.
+        return True
 
     def _process_one(self, text):
         with _active_turns_lock:
@@ -2949,7 +3046,7 @@ class Bridge:
             # a terminal question mark, with an explicit exhaustive-scan protocol.
             knowledge_block = _knowledge_prompt(text) if _should_attach_knowledge(text) else ""
             research_hint = _research_instruction(research_route) if research_route else ""
-            prompt = (knowledge_block + memory_block + _source_precedence_block()
+            prompt = (knowledge_block + memory_block + PERMISSION_POLICY + _source_precedence_block()
                       + SYSTEM_HINT.format(identity=identity) + research_hint + text)
             base_prompt = PRIMER.format(identity=identity) if not sid else ""
             on_progress = self.send_weixin
@@ -3048,7 +3145,7 @@ class Bridge:
                 base_prompt = PRIMER.format(identity=identity)
                 sid = None
             if self.backend == "codex":
-                prompt = (knowledge_block + memory_block + _source_precedence_block()
+                prompt = (knowledge_block + memory_block + PERMISSION_POLICY + _source_precedence_block()
                           + SYSTEM_HINT.format(identity=identity) + prompt)
             else:
                 prompt = knowledge_block + memory_block + _source_precedence_block() + prompt
