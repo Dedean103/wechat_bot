@@ -1734,15 +1734,22 @@ def _extract_long_task(text):
     return task or ""
 
 
-_KNOWLEDGE_RE = re.compile(r"(?<![A-Za-z])knowledge(?![A-Za-z])|知识", re.IGNORECASE)
+_KNOWLEDGE_TRIM = " \t\r\n，,。；;:：-—()（）[]【】"
+_KNOWLEDGE_SEPARATOR = r"[\s，,。；;:：\-—()（）\[\]【】]"
+_KNOWLEDGE_START_RE = re.compile(
+    rf"^(?:knowledge|知识)(?=$|{_KNOWLEDGE_SEPARATOR})", re.IGNORECASE)
+_KNOWLEDGE_END_RE = re.compile(
+    rf"(?:(?<={_KNOWLEDGE_SEPARATOR})(?:knowledge|知识)|^(?:knowledge|知识))$",
+    re.IGNORECASE)
 
 
 def _extract_knowledge(text):
-    """Remove explicit knowledge keywords and return the note to capture."""
-    raw = str(text or "")
-    if not _KNOWLEDGE_RE.search(raw):
+    """Capture notes marked by knowledge at an edge, preserving internal words."""
+    note = str(text or "").strip(_KNOWLEDGE_TRIM)
+    if not (_KNOWLEDGE_START_RE.search(note) or _KNOWLEDGE_END_RE.search(note)):
         return None
-    note = _KNOWLEDGE_RE.sub("", raw).strip(" \t\r\n，,。；;:：-—()（）[]【】")
+    note = _KNOWLEDGE_START_RE.sub("", note, count=1).strip(_KNOWLEDGE_TRIM)
+    note = _KNOWLEDGE_END_RE.sub("", note, count=1).strip(_KNOWLEDGE_TRIM)
     return note or ""
 
 

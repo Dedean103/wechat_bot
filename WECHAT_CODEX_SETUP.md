@@ -345,12 +345,14 @@ source code, or Git.
 
 ## Knowledge capture
 
-Send a WeChat message containing the standalone English keyword `knowledge`
-(case-insensitive) or the Chinese keyword `知识`. The bridge removes every
-occurrence of the keyword and appends the remaining text to
-`ai/memo/knowledge.md`, then confirms the saved text in WeChat. For example,
+Start or end a WeChat message with the English keyword `knowledge`
+(case-insensitive) or the Chinese keyword `知识`, separated from the note by
+whitespace or punctuation. The bridge removes keyword markers at the message
+edges and appends the remaining text to `ai/memo/knowledge.md`, preserving any
+occurrence of either word inside the note. For example,
 `knowledge PostgreSQL backups run nightly` appends
-`PostgreSQL backups run nightly`.
+`PostgreSQL backups run nightly`, while `知识 学习知识图谱 知识` appends
+`学习知识图谱`.
 
 The keyword is a reserved bridge command: after a successful capture, that
 message is not sent to the normal Codex conversation or reminder flow. A
