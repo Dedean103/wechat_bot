@@ -2659,6 +2659,8 @@ class Bridge:
             return
         texts = []
         attachments = []
+        image_attachments = []
+        other_attachments = []
         for item in (msg.get("item_list") or []):
             t = item.get("type")
             if t == ITEM_TEXT:
@@ -2669,8 +2671,16 @@ class Bridge:
                 p = _download_media(item)
                 if p:
                     attachments.append(p)
+                    (image_attachments if t == ITEM_IMAGE else other_attachments).append(p)
         text = "\n".join(texts).strip()
         if not from_user:
+            return
+        # 纯图片作为待处理附件：只保存，不回复、不调用 Agent、不进入任何队列。
+        # inbox 内文件不设自动过期，等用户后续手动清除或明确指令处理。
+        if image_attachments and not text and not other_attachments:
+            self.state["boss_chat"] = from_user
+            log(f"📎 纯图片已保存到 inbox，等待后续指令: {', '.join(Path(a).name for a in image_attachments)}")
+            self.save_state()
             return
         if not text and attachments:
             text = f"[用户发来 {len(attachments)} 个文件，请处理]"
