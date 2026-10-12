@@ -406,6 +406,10 @@ def _research_instruction(route):
 def _save_research_report(text, request_text):
     """Save the final report in the durable ai/memo/investigation archive."""
     from zoneinfo import ZoneInfo
+    _, text = _split_research_reply(text)
+    if not _is_complete_research_report(text):
+        log("调研报告保存失败: 缺少完整报告正文，拒绝归档摘要")
+        return None
     try:
         RESEARCH_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
         stem = f"{datetime.now(ZoneInfo('Asia/Shanghai')):%y%m%d}-{_research_subject(request_text)}"
@@ -416,6 +420,9 @@ def _save_research_report(text, request_text):
             sequence += 1
         report = str(text).strip() + "\n"
         path.write_text(report, encoding="utf-8")
+        if path.read_bytes() != report.encode("utf-8"):
+            path.unlink()
+            raise OSError("归档内容与报告正文不一致")
         return path
     except Exception as e:
         log(f"调研报告保存失败: {str(e)[:120]}")
@@ -423,18 +430,38 @@ def _save_research_report(text, request_text):
 
 
 _RESEARCH_SUMMARY_RE = re.compile(
-    r"【微信调研摘要】\s*(.*?)\s*【报告正文】\s*", re.S)
+    r"^[ \t]*(?:#{1,6}[ \t]+)?【微信调研摘要】[ \t]*\r?$", re.M)
+_RESEARCH_BODY_RE = re.compile(
+    r"^[ \t]*(?:#{1,6}[ \t]+)?【报告正文】[ \t]*\r?$", re.M)
 
 
 def _split_research_reply(reply):
     """Return the optional WeChat summary and the Markdown-only report body."""
     text = str(reply or "").strip()
-    match = _RESEARCH_SUMMARY_RE.search(text)
-    if not match:
-        return "", text
-    summary = match.group(1).strip()
-    body = (text[:match.start()] + text[match.end():]).strip()
-    return summary, body
+    summary_marker = _RESEARCH_SUMMARY_RE.search(text)
+    body_marker = _RESEARCH_BODY_RE.search(text)
+    if body_marker:
+        summary = (text[summary_marker.end():body_marker.start()].strip()
+                   if summary_marker and summary_marker.start() < body_marker.start() else "")
+        return summary, text[body_marker.end():].strip()
+    if summary_marker:
+        return text[summary_marker.end():].strip(), ""
+    return "", text
+
+
+def _is_complete_research_report(text):
+    """Reject chat summaries and empty report shells using required report sections."""
+    text = str(text or "")
+    heading_re = re.compile(r"^(#{1,6})[ \t]+([^\r\n]+)\r?$", re.M)
+    headings = list(heading_re.finditer(text))
+    populated = []
+    for i, heading in enumerate(headings):
+        end = next((other.start() for other in headings[i + 1:]
+                    if len(other.group(1)) <= len(heading.group(1))), len(text))
+        if heading_re.sub("", text[heading.end():end]).strip():
+            populated.append(heading.group(2))
+    return all(any(re.search(pattern, heading) for heading in populated)
+               for pattern in (r"结论", r"调研范围", r"参考(?:来源|笔记)"))
 
 
 def _fallback_research_summary(report_body):
@@ -454,6 +481,9 @@ def _save_research_text_copy(markdown_path):
         markdown_path = Path(markdown_path)
         txt_path = markdown_path.with_suffix(".txt")
         shutil.copyfile(markdown_path, txt_path)
+        if txt_path.read_bytes() != markdown_path.read_bytes():
+            txt_path.unlink()
+            raise OSError("TXT 副本与 Markdown 正文不一致")
         return txt_path
     except (OSError, shutil.Error) as e:
         log(f"调研 TXT 副本保存失败: {str(e)[:120]}")
@@ -461,8 +491,10 @@ def _save_research_text_copy(markdown_path):
 
 
 def _report_body_from_reply(reply, file_paths=()):
-    """Prefer a Markdown report the agent created in its work directory over its chat summary."""
+    """Prefer a complete inline report, then recover from validated local report files."""
     _, reply = _split_research_reply(reply)
+    if _is_complete_research_report(reply):
+        return reply, None
     work_dir = Path(CODEX_WORK_DIR).resolve()
     allowed_roots = (work_dir, RESEARCH_ARCHIVE_DIR.resolve(), AI_MEMO_DIR.resolve())
     candidates = [str(p) for p in file_paths]
@@ -477,8 +509,8 @@ def _report_body_from_reply(reply, file_paths=()):
             if not any(_is_relative_to(source, root) for root in allowed_roots):
                 continue
             if source.is_file():
-                body = source.read_text(encoding="utf-8").strip()
-                if body:
+                _, body = _split_research_reply(source.read_text(encoding="utf-8"))
+                if _is_complete_research_report(body):
                     return body, source
         except (OSError, UnicodeError, ValueError):
             continue
@@ -3009,11 +3041,18 @@ class Bridge:
         """Archive Markdown, then deliver its identical TXT copy plus a conclusion summary."""
         requested_summary, _ = _split_research_reply(report)
         report_body, source = _report_body_from_reply(report, file_paths)
+        if not _is_complete_research_report(report_body):
+            log("调研归档失败: 未收到完整报告正文，未保存或发送摘要文件")
+            self.send_weixin("调研报告归档失败：未收到完整报告正文（结论、调研范围和参考来源/笔记）。未生成 MD/TXT，请补充完整报告后重试。")
+            return True  # Failure was handled; do not send the raw envelope as a report.
         if source:
             log(f"调研归档采用 Agent 生成的完整报告: {source}")
-        path = source if source and _is_relative_to(source, AI_MEMO_DIR.resolve()) else _save_research_report(report_body, request_text)
+        reuse_source = (source and _is_relative_to(source, RESEARCH_ARCHIVE_DIR.resolve())
+                        and source.read_text(encoding="utf-8").strip() == report_body)
+        path = source if reuse_source else _save_research_report(report_body, request_text)
         if not path:
-            return False
+            self.send_weixin("调研报告归档失败：完整正文未能保存，未发送 TXT 文件。请重试。")
+            return True
         txt_path = _save_research_text_copy(path)
         summary = requested_summary or _fallback_research_summary(report_body)
         try:
