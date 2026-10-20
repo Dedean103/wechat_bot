@@ -1885,6 +1885,15 @@ def _reminder_db():
     columns = {row[1] for row in conn.execute("PRAGMA table_info(reminders)")}
     if "calendar_status" not in columns:
         conn.execute("ALTER TABLE reminders ADD COLUMN calendar_status TEXT NOT NULL DEFAULT 'pending'")
+    for name, definition in {
+        "google_calendar_id": "TEXT NOT NULL DEFAULT ''",
+        "google_event_id": "TEXT NOT NULL DEFAULT ''",
+        "google_status": "TEXT NOT NULL DEFAULT 'not_requested'",
+        "google_error": "TEXT",
+    }.items():
+        if name not in columns:
+            conn.execute(f"ALTER TABLE reminders ADD COLUMN {name} {definition}")
+    conn.commit()
     return conn
 
 
@@ -1954,6 +1963,48 @@ def _create_icloud_reminder(title, local_start):
         log(f"日历提醒创建失败: rc={result.returncode} {output[:160]} {(result.stderr or '')[:120]}")
         return None, "写入 iCloud 日历失败"
     return output, None
+
+
+def _google_calendar_call(action, arguments):
+    command = [CODEX_JS] if CODEX_NATIVE else [CODEX_NODE, CODEX_JS]
+    request = {"command": command, "cwd": CODEX_WORK_DIR,
+               "action": action, "arguments": arguments}
+    result = subprocess.run(
+        [sys.executable, str(HERE / "google_calendar_bridge.py")],
+        input=json.dumps(request), capture_output=True, text=True, timeout=90)
+    reply = json.loads(result.stdout)
+    if result.returncode or reply.get("error"):
+        raise RuntimeError("Google Calendar operation failed")
+    return reply.get("data")
+
+
+def _create_google_reminder(title, local_start, calendar_id):
+    try:
+        from zoneinfo import ZoneInfo
+        start = datetime.strptime(local_start, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=ZoneInfo(REMINDER_TIMEZONE))
+        data = _google_calendar_call("create_event", {
+            "calendar_id": calendar_id, "title": title, "attendees": [],
+            "start_time": start.isoformat(), "end_time": (start + timedelta(minutes=30)).isoformat(),
+            "timezone_str": REMINDER_TIMEZONE,
+            "reminders": {"use_default": False, "overrides": [{"method": "popup", "minutes": 10}]}})
+        event = data.get("event", data) if isinstance(data, dict) else {}
+        event_id = event.get("id") or event.get("event_id")
+        if not event_id:
+            raise RuntimeError("Missing Google event ID")
+        return event_id, None
+    except Exception:
+        # Do not retry an ambiguous write: the event may already exist remotely.
+        return None, "Google 日历同步未确认，请检查日历后再重试"
+
+
+def _delete_google_reminder(event_id, calendar_id):
+    if not event_id:
+        return True
+    try:
+        _google_calendar_call("delete_event", {"calendar_id": calendar_id, "event_id": event_id})
+        return True
+    except Exception:
+        return False
 
 
 def _delete_icloud_reminder(event_ref):
@@ -2913,14 +2964,17 @@ class Bridge:
             due_utc = _reminder_due_at(intent["datetime"])
             if not due_utc or not intent["title"]:
                 return False
+            google_calendar_id = str(_load_reminder_config().get("google_calendar_id") or "").strip()
             try:
                 conn = _reminder_db()
                 with conn:
                     conn.execute("""INSERT INTO reminders
-                        (user_id, title, due_at_utc, timezone, calendar_event, calendar_status, created_at_utc)
-                        VALUES (?, ?, ?, ?, ?, 'pending', ?)""",
+                        (user_id, title, due_at_utc, timezone, calendar_event, calendar_status, created_at_utc,
+                         google_calendar_id, google_status)
+                        VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)""",
                         (self.state.get("boss_chat") or self.account.get("user_id", ""), intent["title"], due_utc,
-                         REMINDER_TIMEZONE, "", datetime.now(timezone.utc).replace(microsecond=0).isoformat()))
+                         REMINDER_TIMEZONE, "", datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+                         google_calendar_id, "pending" if google_calendar_id else "not_requested"))
                     reminder_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
                 conn.close()
             except Exception as e:
@@ -2932,7 +2986,7 @@ class Bridge:
             # WeChat notification itself was not created.
             self.send_weixin(
                 f"已设置微信提醒：{intent['datetime'].replace('T', ' ')} 提醒你“{intent['title']}”。"
-                "正在同步 iCloud 日历。"
+                + ("正在同步 iCloud 和 Google 日历。" if google_calendar_id else "正在同步 iCloud 日历。")
             )
 
             # The local durable timer is deliberately created first. Calendar trouble must not suppress WeChat delivery.
@@ -2949,12 +3003,29 @@ class Bridge:
                 self.send_weixin("iCloud 同步失败，但微信定时提醒已保留。")
             else:
                 self.send_weixin("已同步到 iCloud 的 AI助手日历（提前 10 分钟提醒）。")
+            if google_calendar_id:
+                google_event, google_error = _create_google_reminder(
+                    intent["title"], intent["datetime"], google_calendar_id)
+                try:
+                    conn = _reminder_db()
+                    with conn:
+                        conn.execute("UPDATE reminders SET google_event_id=?, google_status=?, google_error=? WHERE id=?",
+                                     (google_event or "", "unconfirmed" if google_error else "created",
+                                      google_error, reminder_id))
+                    conn.close()
+                except Exception:
+                    self.send_weixin("Google 日历同步状态保存失败，请检查日历。")
+                if google_error:
+                    self.send_weixin(google_error + "；微信定时提醒已保留。")
+                else:
+                    self.send_weixin("已同步到 Google 日历（提前 10 分钟提醒）。")
             return True
         if action == "cancel":
             user_id = self.state.get("boss_chat") or self.account.get("user_id", "")
             try:
                 conn = _reminder_db()
-                query = "SELECT id, title, calendar_event FROM reminders WHERE status='scheduled' AND user_id=?"
+                query = ("SELECT id, title, calendar_event, google_event_id, google_calendar_id, google_status "
+                         "FROM reminders WHERE status='scheduled' AND user_id=?")
                 args = [user_id]
                 if intent["title"]:
                     query += " AND title LIKE ?"
@@ -2969,15 +3040,22 @@ class Bridge:
                 row = None
             if row:
                 deleted = _delete_icloud_reminder(row["calendar_event"])
+                google_deleted = _delete_google_reminder(row["google_event_id"], row["google_calendar_id"])
                 try:
                     conn = _reminder_db()
                     with conn:
                         conn.execute("UPDATE reminders SET calendar_status=? WHERE id=?",
                                      ("cancelled" if deleted else "cancelled_local", row["id"]))
+                        conn.execute("UPDATE reminders SET google_status=? WHERE id=?",
+                                     ("cancelled" if google_deleted else "cancel_failed", row["id"]))
                     conn.close()
                 except Exception:
                     pass
                 self.send_weixin(f"已取消提醒“{row['title']}”。")
+                if row["calendar_event"] and not deleted:
+                    self.send_weixin("iCloud 日历事件未能删除，请手动检查。")
+                if not google_deleted or row["google_status"] in {"pending", "unconfirmed"}:
+                    self.send_weixin("Google 日历事件删除未确认，请手动检查。")
             else:
                 self.send_weixin("没有找到可取消的提醒。")
             return True

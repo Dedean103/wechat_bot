@@ -256,6 +256,42 @@ This also handles weeks crossing December and January.
 
 ## Calendar reminders
 
+### Dual-calendar sync (enabled 2026-10-20)
+
+New WeChat reminders create matching 30-minute events in iCloud `AI助手`
+and Google Calendar `dedeanzheng@gmail.com`, interpreted in `Asia/Shanghai`,
+with a 10-minute alarm in each calendar. The durable WeChat timer is saved first.
+Each calendar sync has its own status; a failure in one does not prevent the
+other calendar attempt or WeChat delivery. Cancellation attempts to remove both
+copies and reports any unconfirmed remote cleanup.
+
+`scripts/weixin_bridge/calendar_reminder.json` now contains:
+
+```json
+{
+  "calendar_id": "ai-calendar",
+  "google_calendar_id": "dedeanzheng@gmail.com"
+}
+```
+
+Google uses the existing Codex account connection through the app-server's
+`mcpServer/tool/call` API, via `scripts/google_calendar_bridge.py`; no additional
+Google credential is stored in the bridge. This requires a Codex version that
+supports this API (verified with 0.163.0) and the Google Calendar app connection.
+The helper makes direct tool calls without a model turn, refuses interactive
+authorization requests, and times out after 80 seconds. Writes are not retried
+automatically because a lost response may conceal a successful event creation.
+The user is told to check Google Calendar when a write is unconfirmed.
+
+Existing reminder rows are preserved and are not copied into Google retroactively.
+Each new row stores its Google calendar ID and event ID for later cancellation.
+Removing `google_calendar_id` disables Google sync for new reminders.
+
+Validation: `python3 scripts/test_calendar_sync.py`; live create/read/delete
+was checked in both calendars with a clearly named temporary test event.
+
+The following sections describe the original iCloud/local-timer flow.
+
 The bridge contains a Codex-interpreted calendar-reminder flow. Every incoming
 WeChat message first gets a small, isolated Codex intent pass; reminder wording
 is not matched by a hard-coded `几点提醒我` command. Codex only turns the request
