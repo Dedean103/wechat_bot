@@ -223,12 +223,13 @@ REMINDER_INTERPRETER_PROMPT = """你是微信日历提醒的意图解析器。�
 当前本地时间（{timezone}）：{now}。时区固定为 {timezone}。
 根据用户消息判断 action：
 - create：用户希望在某个时间提醒自己做某事；请把自然语言时间换成 future 的 YYYY-MM-DDTHH:MM:SS，title 为简短提醒内容。
-- 用户只说“几点”而没有明确上午/下午（例如“两点提醒我…”、“2点提醒我…”）时，把它理解为从当前时刻起最近的那个未来时间：先尝试今天的该时刻，如果该时刻已到或已过去，就顺延到明天。例：当前 13:00，“两点”是今天 14:00；当前 23:00，“两点”是明天 02:00。这个规则同样适用于其它没有 AM/PM 的小时表达。
+- 用户只说“几点”而没有明确上午/下午时，理解为最近的那个未来时间：生成今天和明天的上午、下午候选，选择严格晚于当前时间的最早候选。例：当前 18:14，“九点半”是今天 21:30；当前 13:00，“两点”是今天 14:00；当前 23:00，“两点”是明天 02:00。“十二点”对应 00:00 和 12:00。明确日期或时段必须遵守，不得自动改到其它日期或时段。
 - cancel：用户取消一个尚未送达的提醒；title 可为空，datetime 可为空。
 - list：用户要查看提醒。
 - none：其它所有消息。
-只有时间明确、在未来且提醒内容明确时才可 create；不确定时 action=none。不要猜测。
-严格输出：{{\"action\":\"create|cancel|list|none\",\"datetime\":\"YYYY-MM-DDTHH:MM:SS 或空字符串\",\"title\":\"字符串\"}}\n用户消息："""
+- clarify：用户希望创建提醒，但时间不确定、限定冲突或指定时间已过去，需要用户补充时间。
+只有时间明确、在未来且提醒内容明确时才可 create；提醒时间不确定时 action=clarify。不要猜测。
+严格输出：{{\"action\":\"create|cancel|list|none|clarify\",\"datetime\":\"YYYY-MM-DDTHH:MM:SS 或空字符串\",\"title\":\"字符串\"}}\n用户消息："""
 
 SYSTEM_HINT = ("你是{identity}，正在微信里和用户私聊。像日常聊天一样自然回复："
                "口语化、直接、一两句话（内容需要时可以稍长），不要markdown列表、"
@@ -1917,10 +1918,88 @@ def _parse_reminder_json(reply):
         obj = json.loads(match.group(0))
     except Exception:
         return None
-    if not isinstance(obj, dict) or obj.get("action") not in {"create", "cancel", "list", "none"}:
+    if not isinstance(obj, dict) or obj.get("action") not in {"create", "cancel", "list", "none", "clarify"}:
         return None
     return {"action": obj["action"], "datetime": str(obj.get("datetime") or "").strip(),
             "title": str(obj.get("title") or "").strip()[:200]}
+
+
+def _reminder_clock_time(text, now):
+    """Resolve a simple Chinese clock clause independently of the model.
+
+    Return None for other time formats. A clock clause we cannot safely resolve
+    raises ValueError so it cannot reach storage or either calendar unchecked.
+    Only inspect the clause before 提醒, never clock words in the task title.
+    """
+    clause, marker, _ = str(text).partition("提醒")
+    if not marker:
+        return None
+    number = r"[0-9零〇一二两三四五六七八九十]+"
+    clock = rf"(?P<hour>{number})(?:点|时|[:：])(?P<minute>半|一刻|三刻|{number}分?)?(?:(?P<second>{number})秒)?"
+    if not re.search(rf"{number}(?:点|时|[:：])", clause):
+        return None
+    match = re.fullmatch(
+        rf"\s*(?:请|麻烦|帮我|请帮我|在|到|于|给我|请在|请到|麻烦在|帮我在)*\s*"
+        rf"(?P<day>今天|明天|后天|今晚|明早|明晚)?\s*"
+        rf"(?P<period>凌晨|早上|早晨|上午|中午|下午|晚上|傍晚)?\s*"
+        rf"{clock}\s*(?:整|钟|的时候|时)?\s*[，,]?\s*", clause)
+    if not match:
+        raise ValueError("unsupported or conflicting clock clause")
+
+    def integer(value):
+        if value.isascii() and value.isdigit():
+            return int(value)
+        digits = {c: i for i, c in enumerate("零一二三四五六七八九")}
+        digits.update({"〇": 0, "两": 2})
+        if "十" in value:
+            tens, units = value.split("十")
+            return (digits[tens] if tens else 1) * 10 + (digits[units] if units else 0)
+        return digits[value]
+
+    try:
+        hour = integer(match["hour"])
+        minute_text = match["minute"] or "0"
+        if (match["second"] and match["minute"] and minute_text not in {"半", "一刻", "三刻"}
+                and not minute_text.endswith("分")):
+            raise ValueError("seconds require a minute separator")
+        minute = {"半": 30, "一刻": 15, "三刻": 45}.get(minute_text)
+        if minute is None:
+            minute = integer(minute_text.removesuffix("分"))
+        second = integer(match["second"] or "0")
+    except (KeyError, ValueError):
+        raise ValueError("invalid clock number") from None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59):
+        raise ValueError("invalid clock time")
+    day, period = match["day"], match["period"]
+    implied_period = {"今晚": "晚上", "明早": "早上", "明晚": "晚上"}.get(day)
+    if implied_period and period and period != implied_period:
+        raise ValueError("conflicting time periods")
+    period = period or implied_period
+    if period:
+        if period in {"凌晨", "早上", "早晨", "上午"}:
+            if hour > 12 or (hour == 12 and period != "凌晨"):
+                raise ValueError("conflicting morning hour")
+            hours = [hour % 12]
+        elif period in {"下午", "晚上", "傍晚"}:
+            if (hour == 0 or (period in {"晚上", "傍晚"} and hour not in {6, 7, 8, 9, 10, 11, 18, 19, 20, 21, 22, 23})
+                    or (period == "下午" and hour not in {1, 2, 3, 4, 5, 6, 12, 13, 14, 15, 16, 17, 18})):
+                raise ValueError("ambiguous afternoon hour")
+            hours = [hour % 12 + 12 if hour <= 12 else hour]
+        else:
+            # 中午一点/十二点 are conventional; other noon hours need confirmation.
+            if hour not in {1, 11, 12, 13}:
+                raise ValueError("ambiguous noon hour")
+            hours = [13 if hour == 1 else hour]
+    else:
+        hours = [hour % 12, hour % 12 + 12] if 1 <= hour <= 12 else [hour]
+    offsets = {"今天": 0, "今晚": 0, "明天": 1, "明早": 1, "明晚": 1, "后天": 2}
+    days = [offsets[day]] if day else [0, 1]
+    candidates = [now.replace(hour=h, minute=minute, second=second, microsecond=0) + timedelta(days=d)
+                  for d in days for h in hours]
+    future = [candidate for candidate in candidates if candidate > now]
+    if not future:
+        raise ValueError("specified time has already passed")
+    return min(future).strftime("%Y-%m-%dT%H:%M:%S")
 
 
 def _reminder_due_at(value):
@@ -2948,22 +3027,36 @@ class Bridge:
     def _understand_reminder(self, text):
         """Ask Codex to interpret reminder language without changing the user's chat session."""
         from zoneinfo import ZoneInfo
-        now = datetime.now(ZoneInfo(REMINDER_TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S")
-        prompt = REMINDER_INTERPRETER_PROMPT.format(timezone=REMINDER_TIMEZONE, now=now) + str(text)
+        now = datetime.now(ZoneInfo(REMINDER_TIMEZONE))
+        prompt = REMINDER_INTERPRETER_PROMPT.format(
+            timezone=REMINDER_TIMEZONE, now=now.strftime("%Y-%m-%d %H:%M:%S")) + str(text)
         cfg = self.backend_cfg or {}
         reply, _ = codex_reply(prompt, model=cfg.get("chat_model") or CHAT_MODEL,
                                effort=cfg.get("chat_effort") or CHAT_EFFORT, timeout=45)
-        return _parse_reminder_json(reply)
+        intent = _parse_reminder_json(reply)
+        if intent and intent["action"] == "create":
+            try:
+                clock_time = _reminder_clock_time(text, now)
+            except ValueError:
+                intent["action"] = "clarify"
+            else:
+                if clock_time:
+                    intent["datetime"] = clock_time
+        return intent
 
     def _handle_reminder_action(self, intent):
         """Handle a Codex-recognised reminder action. Return True only when it consumed this message."""
         if not intent or intent["action"] == "none":
             return False
         action = intent["action"]
+        if action == "clarify":
+            self.send_weixin("请确认提醒的具体日期和时间，例如“今天晚上九点半提醒我茶壶和保温壶”。")
+            return True
         if action == "create":
             due_utc = _reminder_due_at(intent["datetime"])
             if not due_utc or not intent["title"]:
-                return False
+                self.send_weixin("提醒尚未创建，请补充提醒内容和未来的具体日期、时间。")
+                return True
             google_calendar_id = str(_load_reminder_config().get("google_calendar_id") or "").strip()
             try:
                 conn = _reminder_db()
