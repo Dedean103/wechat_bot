@@ -43,6 +43,7 @@ import uuid
 from collections import deque
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from research_diagnostics import capture_diagnostics
 from Crypto.Cipher import AES
 
 HERE = Path(__file__).parent
@@ -87,6 +88,13 @@ _DEFAULT_CLAUDE_EXE = ""
 _DEFAULT_WORK_DIR = ""  # 留空则用仓库根目录下的 wechat_work/
 REPLY_TIMEOUT = 600
 TURN_HANG_TIMEOUT = 90    # 常驻连接单轮无任何事件超过此秒数视为卡死，静默自愈重试
+RESEARCH_HANG_TIMEOUT = 360  # Browser queue + operation must finish before inactivity interruption.
+RESEARCH_TOTAL_TIMEOUT = 20 * 60  # Shared across retries for one research execution.
+RESEARCH_MAX_ATTEMPTS = 3
+RESEARCH_MAX_DELIVERY_ATTEMPTS = 3
+RESEARCH_RETRY_BASE = 30
+RESEARCH_RETRY_MAX = 15 * 60
+RESEARCH_RETRY_POLL = 2
 TURN_HANG_TIMEOUT_TASK = 300  # 任务：执行命令时可能长时间无文本事件，放宽到 300s
 # 模型分工（2026-08-14 稳定版）：对话用快速档保证秒回，任务用质量档；可在 backend.json 覆盖
 CHAT_MODEL = "deepseek-v4-flash"
@@ -99,6 +107,50 @@ ALIVE_NUDGE_INTERVAL = 60          # 保活提示最小间隔（秒），防刷�
 BACKEND_FILE = DATA_DIR / "backend.json"
 DEFAULT_BACKEND = "codex"
 BACKEND_IDENTITY = {"codex": "李白的助手", "claude": "李白的助手", "generic": "AI 助手"}
+_RESEARCH_STAGE_LABELS = {
+    "backend": "模型后端",
+    "model_routing": "模型路由",
+    "browser_page": "浏览器页面",
+    "archive_processing": "报告归档",
+    "model_execution": "模型执行",
+    "helper_startup": "助手启动",
+    "deadline": "总时限",
+    "search": "搜索/页面",
+    "archive": "报告归档",
+    "wechat_delivery": "微信发送",
+    "restart_recovery": "桥重启恢复",
+    "retry_limit": "重试上限",
+    "bridge": "桥处理",
+}
+
+
+class ResearchDeliveryOutcome(dict):
+    """Structured archive/delivery result with legacy truthiness.
+
+    Older callers only checked whether the outcome was handled.  New callers
+    inspect ``success``/``stage`` so an archive failure cannot be mistaken for
+    a delivered report while the compatibility truth value remains useful in
+    existing tests and integrations.
+    """
+
+    def __init__(self, *, success=False, handled=True, stage="", reason="",
+                 archive_paths=(), summary_sent=False, file_sent=False,
+                 notification_sent=False):
+        super().__init__(success=bool(success), handled=bool(handled), stage=stage,
+                         reason=reason, archive_paths=[str(p) for p in archive_paths if p],
+                         summary_sent=bool(summary_sent), file_sent=bool(file_sent),
+                         notification_sent=bool(notification_sent))
+
+    def __getattr__(self, key):
+        try:
+            return self[key]
+        except KeyError as exc:
+            raise AttributeError(key) from exc
+
+    def __bool__(self):
+        # Preserve the old "handled" contract for direct callers.  Research
+        # lifecycle code must use ``outcome.success`` explicitly.
+        return bool(self.get("handled"))
 
 
 def _resolve_tool_paths():
@@ -393,10 +445,11 @@ def _research_instruction(route):
 【微信调研摘要】
 用 50–100 个中文字符写出可独立阅读的结论摘要：回答推荐/不推荐什么、最重要的依据、适用条件和关键风险；不要用“详见报告”等代指。
 【报告正文】
-随后输出完整 Markdown 报告。桥只会把“报告正文”归档到本地 Markdown/TXT 文件，并将摘要作为微信文字消息发送。
+随后输出完整 Markdown 报告；不要在报告外追加【总结】，微信摘要已经单独提供。桥只会把“报告正文”归档到本地 Markdown/TXT 文件，并将摘要作为微信文字消息发送。
 """
     if route == "xhs":
         return common + """【来源路由：小红书】
+浏览器调用每批最多 3 个，上一批完成后再开始下一批。
 用户明确要求用小红书调研。必须使用当前设备已安装的 xhs-research / xiaohongshu 技能流程：先检查 MCP 可用性与登录状态，再用小红书 MCP 检索、阅读详情和评论。严格遵守该技能的固定报告格式；参考来源列为“参考笔记”，不得用普通网页搜索替代小红书调研。
 """
     return common + """【来源路由：普通网页】
@@ -404,7 +457,16 @@ def _research_instruction(route):
 """
 
 
-def _save_research_report(text, request_text):
+def _research_archive_target(request_text, task_id=None):
+    """Return a stable per-task archive target to make crash recovery idempotent."""
+    from zoneinfo import ZoneInfo
+    stem = f"{datetime.now(ZoneInfo('Asia/Shanghai')):%y%m%d}-{_research_subject(request_text)}"
+    if task_id:
+        stem += "-" + re.sub(r"[^A-Za-z0-9_-]", "", str(task_id))[:40]
+    return RESEARCH_ARCHIVE_DIR / f"{stem}.md"
+
+
+def _save_research_report(text, request_text, target_path=None):
     """Save the final report in the durable ai/memo/investigation archive."""
     from zoneinfo import ZoneInfo
     _, text = _split_research_reply(text)
@@ -413,12 +475,13 @@ def _save_research_report(text, request_text):
         return None
     try:
         RESEARCH_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-        stem = f"{datetime.now(ZoneInfo('Asia/Shanghai')):%y%m%d}-{_research_subject(request_text)}"
-        path = RESEARCH_ARCHIVE_DIR / f"{stem}.md"
-        sequence = 2
-        while path.exists():
-            path = RESEARCH_ARCHIVE_DIR / f"{stem}-{sequence}.md"
-            sequence += 1
+        path = Path(target_path) if target_path else _research_archive_target(request_text)
+        if not target_path:
+            stem = path.stem
+            sequence = 2
+            while path.exists():
+                path = RESEARCH_ARCHIVE_DIR / f"{stem}-{sequence}.md"
+                sequence += 1
         report = str(text).strip() + "\n"
         path.write_text(report, encoding="utf-8")
         if path.read_bytes() != report.encode("utf-8"):
@@ -431,7 +494,7 @@ def _save_research_report(text, request_text):
 
 
 _RESEARCH_SUMMARY_RE = re.compile(
-    r"^[ \t]*(?:#{1,6}[ \t]+)?【微信调研摘要】[ \t]*\r?$", re.M)
+    r"^[ \t]*(?:#{1,6}[ \t]+)?【微信调研摘要】[ \t]*", re.M)
 _RESEARCH_BODY_RE = re.compile(
     r"^[ \t]*(?:#{1,6}[ \t]+)?【报告正文】[ \t]*\r?$", re.M)
 
@@ -775,11 +838,13 @@ class _CircuitBreaker:
 
 # ───────────────────────── 发送重试队列（防丢消息） ─────────────────────────
 
-def _save_to_retry_queue(to, text, context_token=None):
+def _save_to_retry_queue(to, text, context_token=None, research_task_id=None):
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         entry = {"to": to, "text": text, "context_token": context_token,
                  "ts": datetime.now().isoformat()}
+        if research_task_id:
+            entry["research_task_id"] = research_task_id
         with open(RETRY_QUEUE_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         log(f"📥 发送失败已入重试队列: to={str(to)[:14]} len={len(text)}")
@@ -891,7 +956,11 @@ def stop_current_task():
 
 
 def _clean_final(out, sent_markers):
-    """清理最终回复：去掉已转发的标记行，若含【总结】则取其正文。"""
+    """Preserve research bodies; extract the closing summary only for ordinary chat."""
+    # Research must retain the complete envelope and Markdown whitespace.
+    # Older/resumed sessions may still append the ordinary chat summary marker.
+    if _RESEARCH_BODY_RE.search(out or "") or _is_complete_research_report(out):
+        return (out or "").strip() or None
     lines = []
     for raw in (out or "").splitlines():
         l = raw.strip()
@@ -987,8 +1056,9 @@ def _ensure_app_server():
         cmd = [CODEX_NODE, CODEX_JS, "app-server", "--listen", _APP_SERVER_URL]
     _app_server_proc = subprocess.Popen(
         cmd,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    capture_diagnostics(_app_server_proc.stdout, DATA_DIR / "diagnostics", "app-server")
     for _ in range(20):
         time.sleep(1)
         if _port_listening(_APP_SERVER_PORT):
@@ -1062,10 +1132,11 @@ def _helper_ensure():
     try:
         _helper_proc = subprocess.Popen([CODEX_NODE, _HELPER_JS],
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                        stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+                                        stderr=subprocess.PIPE, text=True, encoding="utf-8",
                                         errors="replace",
                                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         _helper_in = _helper_proc.stdin
+        capture_diagnostics(_helper_proc.stderr, DATA_DIR / "diagnostics", "codex-helper")
         _helper_out = _helper_proc.stdout
         _helper_q = queue.Queue()
         with _turn_queues_lock:
@@ -1173,10 +1244,11 @@ def _claude_helper_ensure():
         env["CLAUDE_CLI"] = CLAUDE_EXE
         _claude_proc = subprocess.Popen([sys.executable, "-u", _CLAUDE_HELPER_PY],
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                        stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+                                        stderr=subprocess.PIPE, text=True, encoding="utf-8",
                                         errors="replace", env=env,
                                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         _claude_in = _claude_proc.stdin
+        capture_diagnostics(_claude_proc.stderr, DATA_DIR / "diagnostics", "claude-helper")
         _claude_out = _claude_proc.stdout
         _claude_q = queue.Queue()
         with _claude_turn_queues_lock:
@@ -1512,21 +1584,58 @@ def _append_memory(entry):
         log(f"记忆写入失败: {str(e)[:80]}")
 
 
+def _research_checkpoint(checkpoint, stage, error="", session_id=None, partial=None):
+    """Send a small durable backend checkpoint without letting it break a turn."""
+    if not checkpoint:
+        return
+    try:
+        checkpoint({"stage": stage, "error": str(error or "")[:500],
+                    "session_id": session_id, "partial": str(partial or "")[:1000],
+                    "ts": datetime.now(timezone.utc).isoformat()})
+    except Exception:
+        pass
+
+
+def _backend_cancelled(cancel_check=None):
+    """Check a durable job cancellation without relying on the global chat flag."""
+    if not cancel_check:
+        return False
+    try:
+        return bool(cancel_check())
+    except Exception:
+        return False
+
+
 def codex_reply(prompt, session_id=None, on_progress=None, model=None, effort=None, base=None, timeout=None,
-                preempt_evt=None, preempt_ctx=None):
+                preempt_evt=None, preempt_ctx=None, deadline=None, checkpoint=None, cancel_check=None):
     """通过常驻 app-server 连接生成回复（不每条消息重启 Codex）。"""
     global _helper_proc
     hang_timeout = timeout or TURN_HANG_TIMEOUT
+    if _cancel_event.is_set() or _backend_cancelled(cancel_check):
+        return None, session_id
+    if deadline is not None and time.monotonic() >= deadline:
+        _research_checkpoint(checkpoint, "deadline", "deadline expired before provider probe", session_id)
+        return None, session_id
     if not _probe_codex_provider():
+        _research_checkpoint(checkpoint, "backend", "provider unavailable", session_id)
         log("⚠️ Codex 模型服务不可达（本地代理未启动），跳过本轮")
         return None, session_id
     for attempt in range(3):
+        if _cancel_event.is_set() or _backend_cancelled(cancel_check):
+            return None, session_id
+        if deadline is not None and time.monotonic() >= deadline:
+            _research_checkpoint(checkpoint, "deadline", "deadline expired before retry", session_id)
+            log("调研执行超时：已达到总时间限制")
+            return None, session_id
         if preempt_evt is not None and preempt_evt.is_set():
+            return None, session_id
+        if _cancel_event.is_set() or _backend_cancelled(cancel_check):
             return None, session_id
         _cancel_event.clear()
         with _helper_lock:
             ok = _helper_ensure()
         if not ok:
+            _research_checkpoint(checkpoint, "helper_startup", "Codex helper unavailable", session_id)
             log("⚠️ Codex 常驻服务不可用")
             return None, session_id
         try:
@@ -1536,6 +1645,8 @@ def codex_reply(prompt, session_id=None, on_progress=None, model=None, effort=No
             my_q = queue.Queue()
             with _turn_queues_lock:
                 _turn_queues[req_id] = my_q
+            partial_accum = ""
+            last_partial_checkpoint = time.monotonic()
             try:
                 payload = {"type": "turn", "id": req_id, "threadId": session_id,
                            "prompt": prompt, "cwd": CODEX_WORK_DIR}
@@ -1545,21 +1656,35 @@ def codex_reply(prompt, session_id=None, on_progress=None, model=None, effort=No
                     payload["effort"] = effort
                 if base:
                     payload["base"] = base
+                if _backend_cancelled(cancel_check):
+                    return None, session_id
+                if deadline is not None and time.monotonic() >= deadline:
+                    _research_checkpoint(checkpoint, "deadline", "deadline expired before turn", session_id)
+                    return None, session_id
                 if not _helper_send(payload):
+                    _research_checkpoint(checkpoint, "backend", "helper send failed", session_id)
                     raise RuntimeError("助手未连接")
-                last_event = time.time()
-                last_alive = time.time()
+                last_event = time.monotonic()
+                last_alive = time.monotonic()
                 while True:
                     if _cancel_event.is_set():
                         return None, session_id
+                    if _backend_cancelled(cancel_check):
+                        return None, session_id
                     if preempt_evt is not None and preempt_evt.is_set():
                         return None, session_id
-                    now = time.time()
+                    now = time.monotonic()
+                    if deadline is not None and now >= deadline:
+                        _helper_send({"type": "interrupt", "reqId": req_id})
+                        _research_checkpoint(checkpoint, "deadline", "overall research deadline", session_id)
+                        log("调研执行超时：已达到总时间限制")
+                        return None, session_id
                     if now - last_event > hang_timeout:
                         try:
-                            _helper_send({"type": "interrupt"})
+                            _helper_send({"type": "interrupt", "reqId": req_id})
                         except Exception:
                             pass
+                        _research_checkpoint(checkpoint, "backend", "single-turn inactivity timeout", session_id)
                         raise RuntimeError("HANG: 单轮无事件超时")
                     if now - last_alive >= ALIVE_NUDGE_INTERVAL and now - last_event >= ALIVE_NUDGE_S:
                         try:
@@ -1572,11 +1697,26 @@ def codex_reply(prompt, session_id=None, on_progress=None, model=None, effort=No
                         obj = my_q.get(timeout=5)
                     except queue.Empty:
                         continue
-                    last_event = time.time()
+                    last_event = time.monotonic()
+                    sid_hint = obj.get("threadId") or obj.get("sessionId")
+                    if sid_hint:
+                        session_id = sid_hint
+                        _research_checkpoint(checkpoint, "session", "", sid_hint)
                     t = obj.get("type")
                     if t == "exit":
+                        _research_checkpoint(checkpoint, "helper_startup", "helper exited", session_id)
                         raise RuntimeError("助手退出")
-                    if t == "progress" and on_progress:
+                    if t == "delta":
+                        partial_accum += str(obj.get("text") or "")
+                        if (len(partial_accum) >= 1000
+                                or time.monotonic() - last_partial_checkpoint >= 10):
+                            _research_checkpoint(checkpoint, "partial", "", session_id,
+                                                 partial_accum[-3000:])
+                            partial_accum = ""
+                            last_partial_checkpoint = time.monotonic()
+                    elif t == "session":
+                        _research_checkpoint(checkpoint, "session", "", sid_hint or session_id)
+                    elif t == "progress" and on_progress:
                         try:
                             on_progress(obj.get("text") or "")
                         except Exception:
@@ -1584,15 +1724,25 @@ def codex_reply(prompt, session_id=None, on_progress=None, model=None, effort=No
                     elif t == "result":
                         text = (obj.get("text") or "").strip()
                         reply = _clean_final(text, set())
-                        return reply or None, obj.get("threadId") or session_id
+                        new_sid = obj.get("threadId") or session_id
+                        if partial_accum:
+                            _research_checkpoint(checkpoint, "partial", "", new_sid, partial_accum[-3000:])
+                        _research_checkpoint(checkpoint, "completed", "", new_sid, reply)
+                        return reply or None, new_sid
                     elif t == "error":
+                        _research_checkpoint(checkpoint, "backend", obj.get("message") or "turn error", session_id)
                         raise RuntimeError(obj.get("message") or "turn error")
             finally:
+                if partial_accum:
+                    _research_checkpoint(checkpoint, "partial", "", session_id, partial_accum[-3000:])
                 with _turn_queues_lock:
                     _turn_queues.pop(req_id, None)
         except Exception as e:
             msg = str(e)
+            _research_checkpoint(checkpoint, "backend", msg, session_id)
             log(f"⚠️ Codex 常驻连接异常(第{attempt+1}次): {msg[:120]}")
+            if _backend_cancelled(cancel_check):
+                return None, session_id
             if "HANG" in msg:
                 if attempt >= 2:
                     log("🧹 多次卡死：放弃旧线程并重启常驻连接（自愈）")
@@ -1616,6 +1766,8 @@ def codex_reply(prompt, session_id=None, on_progress=None, model=None, effort=No
                             pass
                         _helper_proc = None
                 time.sleep(3)
+            if _backend_cancelled(cancel_check):
+                return None, session_id
     return None, session_id
 
 
@@ -2100,13 +2252,18 @@ def _delete_icloud_reminder(event_ref):
         return False
 
 
-def _claude_reply_persistent(prompt, session_id=None, on_progress=None, base=None, timeout=None):
+def _claude_reply_persistent(prompt, session_id=None, on_progress=None, base=None, timeout=None,
+                             cancel_check=None):
     """通过常驻 claude 子进程生成回复（不每条消息冷启动）。"""
     global _claude_proc
     hang_timeout = timeout or TURN_HANG_TIMEOUT
+    if _backend_cancelled(cancel_check):
+        return None, session_id
+    if _cancel_event.is_set() or _backend_cancelled(cancel_check):
+        return None, session_id
     _cancel_event.clear()
     for attempt in range(3):
-        if _cancel_event.is_set():
+        if _cancel_event.is_set() or _backend_cancelled(cancel_check):
             return None, session_id
         with _claude_lock:
             ok = _claude_helper_ensure()
@@ -2123,12 +2280,14 @@ def _claude_reply_persistent(prompt, session_id=None, on_progress=None, base=Non
                            "prompt": prompt}
                 if base:
                     payload["base"] = base
+                if _backend_cancelled(cancel_check):
+                    return None, session_id
                 if not _claude_helper_send(payload):
                     raise RuntimeError("助手未连接")
                 last_event = time.time()
                 last_alive = time.time()
                 while True:
-                    if _cancel_event.is_set():
+                    if _cancel_event.is_set() or _backend_cancelled(cancel_check):
                         return None, session_id
                     now = time.time()
                     if now - last_event > hang_timeout:
@@ -2169,6 +2328,8 @@ def _claude_reply_persistent(prompt, session_id=None, on_progress=None, base=Non
         except Exception as e:
             msg = str(e)
             log(f"⚠️ Claude 常驻连接异常(第{attempt+1}次): {msg[:120]}")
+            if _backend_cancelled(cancel_check):
+                return None, session_id
             if "HANG" in msg:
                 if attempt >= 2:
                     log("🧹 多次卡死：重启 Claude 常驻连接（自愈）")
@@ -2189,20 +2350,25 @@ def _claude_reply_persistent(prompt, session_id=None, on_progress=None, base=Non
                             pass
                         _claude_proc = None
                 time.sleep(3)
+            if _backend_cancelled(cancel_check):
+                return None, session_id
     return None, session_id
 
 
-def claude_reply(prompt, session_id=None, on_progress=None, base=None, timeout=None):
+def claude_reply(prompt, session_id=None, on_progress=None, base=None, timeout=None, cancel_check=None):
     """Claude Code 回复：优先常驻子进程（不冷启动），失败自动回退 spawn 模式。"""
     reply, sid = _claude_reply_persistent(prompt, session_id, on_progress,
-                                          base=base, timeout=timeout)
+                                          base=base, timeout=timeout, cancel_check=cancel_check)
     if reply is not None:
         return reply, sid
+    if _backend_cancelled(cancel_check):
+        return None, sid
     log("↩️ Claude 常驻通道失败，回退 spawn 模式")
-    return _claude_reply_spawn(prompt, session_id, on_progress, base=base)
+    return _claude_reply_spawn(prompt, session_id, on_progress, base=base,
+                               cancel_check=cancel_check)
 
 
-def _claude_reply_spawn(prompt, session_id=None, on_progress=None, base=None):
+def _claude_reply_spawn(prompt, session_id=None, on_progress=None, base=None, cancel_check=None):
     """（回退路径）调本机 Claude Code CLI（stream-json）生成回复。支持续接、进度转发与 /stop。"""
     global _active_codex_proc
     exe = CLAUDE_EXE
@@ -2220,6 +2386,10 @@ def _claude_reply_spawn(prompt, session_id=None, on_progress=None, base=None):
     if session_id:
         cmd += ["--resume", session_id]
     for attempt in range(3):
+        if _backend_cancelled(cancel_check):
+            return None, session_id
+        if _cancel_event.is_set() or _backend_cancelled(cancel_check):
+            return None, session_id
         _cancel_event.clear()
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -2281,7 +2451,7 @@ def _claude_reply_spawn(prompt, session_id=None, on_progress=None, base=None):
             pump_thread = threading.Thread(target=_pump, daemon=True)
             pump_thread.start()
             while proc.poll() is None:
-                if _cancel_event.is_set():
+                if _cancel_event.is_set() or _backend_cancelled(cancel_check):
                     try:
                         proc.kill()
                     except Exception:
@@ -2305,18 +2475,20 @@ def _claude_reply_spawn(prompt, session_id=None, on_progress=None, base=None):
             with _proc_lock:
                 if _active_codex_proc is proc:
                     _active_codex_proc = None
-            if _cancel_event.is_set():
+            if _cancel_event.is_set() or _backend_cancelled(cancel_check):
                 return None, session_id
             if proc.returncode == 0 and result["reply"]:
                 return result["reply"], result["sid"] or session_id
             log(f"⚠️ claude CLI失败(第{attempt+1}次): rc={proc.returncode}")
         except Exception as e:
             log(f"⚠️ claude CLI异常(第{attempt+1}次): {e}")
+        if _backend_cancelled(cancel_check):
+            return None, session_id
         time.sleep(20 * (attempt + 1))
     return None, session_id
 
 
-def generic_reply(prompt, session_id=None, on_progress=None, cfg=None):
+def generic_reply(prompt, session_id=None, on_progress=None, cfg=None, cancel_check=None):
     """通用 CLI 后端：按 backend.json 里的 new_cmd/resume_cmd 模板调用任意 agent。"""
     global _active_codex_proc
     cfg = cfg or {}
@@ -2335,6 +2507,10 @@ def generic_reply(prompt, session_id=None, on_progress=None, cfg=None):
         if cmd[0].lower().endswith(".js"):
             cmd.insert(0, CODEX_NODE)
     for attempt in range(3):
+        if _backend_cancelled(cancel_check):
+            return None, session_id
+        if _cancel_event.is_set() or _backend_cancelled(cancel_check):
+            return None, session_id
         _cancel_event.clear()
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -2379,7 +2555,7 @@ def generic_reply(prompt, session_id=None, on_progress=None, cfg=None):
             t1.start()
             t2.start()
             while proc.poll() is None:
-                if _cancel_event.is_set():
+                if _cancel_event.is_set() or _backend_cancelled(cancel_check):
                     try:
                         proc.kill()
                     except Exception:
@@ -2403,7 +2579,7 @@ def generic_reply(prompt, session_id=None, on_progress=None, cfg=None):
             with _proc_lock:
                 if _active_codex_proc is proc:
                     _active_codex_proc = None
-            if _cancel_event.is_set():
+            if _cancel_event.is_set() or _backend_cancelled(cancel_check):
                 return None, session_id
             reply = "".join(out_lines).strip()
             if proc.returncode == 0 and reply:
@@ -2411,20 +2587,32 @@ def generic_reply(prompt, session_id=None, on_progress=None, cfg=None):
             log(f"⚠️ generic CLI失败(第{attempt+1}次): rc={proc.returncode}")
         except Exception as e:
             log(f"⚠️ generic CLI异常(第{attempt+1}次): {e}")
+        if _backend_cancelled(cancel_check):
+            return None, session_id
         time.sleep(20 * (attempt + 1))
     return None, session_id
 
 
 def agent_reply(backend, prompt, session_id=None, on_progress=None, cfg=None,
                 model=None, effort=None, base=None, timeout=None,
-                preempt_evt=None, preempt_ctx=None):
+                preempt_evt=None, preempt_ctx=None, deadline=None, checkpoint=None,
+                cancel_check=None):
     """按后端分派回复生成。"""
+    # Each dispatch is a new invocation; an earlier /stop must not consume
+    # the next chat message. Research cancellation belongs to the durable job
+    # and must survive this reset (and another chat's dispatch).
+    if _backend_cancelled(cancel_check):
+        return None, session_id
+    _cancel_event.clear()
     if backend == "claude":
-        return claude_reply(prompt, session_id, on_progress, base=base, timeout=timeout)
+        return claude_reply(prompt, session_id, on_progress, base=base, timeout=timeout,
+                            cancel_check=cancel_check)
     if backend == "generic":
-        return generic_reply(prompt, session_id, on_progress, (cfg or {}).get("generic") or {})
+        return generic_reply(prompt, session_id, on_progress, (cfg or {}).get("generic") or {},
+                             cancel_check=cancel_check)
     return codex_reply(prompt, session_id, on_progress, model=model, effort=effort,
-                       base=base, timeout=timeout, preempt_evt=preempt_evt, preempt_ctx=preempt_ctx)
+                       base=base, timeout=timeout, preempt_evt=preempt_evt, preempt_ctx=preempt_ctx,
+                       deadline=deadline, checkpoint=checkpoint, cancel_check=cancel_check)
 
 
 # ───────────────────────── 注册（QR 扫码） ─────────────────────────
@@ -2544,6 +2732,7 @@ class Bridge:
         self._q_cond = threading.Condition()
         self.task_q = deque()          # 后台任务队列（FIFO 顺序执行）
         self._task_cond = threading.Condition()
+        self._research_lock = threading.RLock()
         self._task_preempt = threading.Event()   # 聊天到达时置位：任务让位
         self._chat_active = 0                    # 当前正在处理的聊天数
         self._running_task = {"active": False, "sid": None, "desc": "", "req_id": None}
@@ -2551,20 +2740,11 @@ class Bridge:
         self._send_ts = []
         self._send_lock = threading.Lock()
         replied_fps = set(self.state.get("replied_fps") or [])
-        for _t in self.state.pop("pending_replies", []) or []:
-            if _t:
-                self.reply_q.appendleft(_t)
-        for leftover in (self.state.pop("processing", None) or []):
-            if leftover:
-                fp = hashlib.md5((self.account.get("user_id", "") + "|" + leftover).encode("utf-8")).hexdigest()
-                if fp in replied_fps:
-                    log(f"♻️ 跳过补回（已回复过）: {leftover[:30]}")
-                    continue
-                log(f"♻️ 上次中断时正在处理的消息补回队列: {leftover[:40]}")
-                self.reply_q.appendleft(leftover)
-        for _t in self.state.pop("task_queue", []) or []:
-            if _t:
-                self.task_q.append(_t)
+        pending_replies = self.state.pop("pending_replies", []) or []
+        interrupted = self.state.pop("processing", None) or []
+        persisted_tasks = self.state.pop("task_queue", []) or []
+        self._restore_persisted_queues(pending_replies, interrupted, persisted_tasks, replied_fps)
+        self._restore_research_jobs()
         self.cb = _CircuitBreaker(self.account.get("account_id", "bridge"))
         self._last_poll_ts = time.time()
         self._retry_queue_flush_ts = 0.0
@@ -2603,6 +2783,746 @@ class Bridge:
             tmp.write_text(json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8")
             os.replace(tmp, STATE_FILE)
             self._persist_account_state(self.account, self.state)
+
+    def _restore_persisted_queues(self, pending_replies, interrupted, persisted_tasks, replied_fps):
+        """Normalize legacy queue strings and deduplicate durable research work."""
+        research_ids = set()
+
+        def enqueue_research_text(text):
+            route = _research_request(text)
+            if not route:
+                return False
+            previous_account = self.state.get("session_account") or ""
+            if previous_account and previous_account != self.account.get("account_id", ""):
+                log(f"♻️ 跳过旧账号调研恢复: {text[:40]}")
+                return True
+            # Legacy queue entries contain only the request text.  A terminal
+            # durable job therefore proves that this is an old admission, not
+            # a new request: new admissions carry their task-id envelope.  Do
+            # not resurrect a delivered/failed/cancelled task from the stale
+            # ``processing``/``pending_replies`` strings left by older builds.
+            job = self._find_research_job(text, include_terminal=True)
+            if job and job.get("status") in {"delivered", "failed", "cancelled"}:
+                log(f"♻️ 跳过已结束调研的旧文本恢复: {text[:40]}")
+                research_ids.add(job.get("task_id"))
+                return True
+            task_id = job["task_id"] if job else self._create_research_job(text, route)
+            if task_id in research_ids:
+                return True
+            research_ids.add(task_id)
+            self._research_queue_item(task_id)
+            return True
+
+        for item in pending_replies:
+            text = item.get("text", "") if isinstance(item, dict) else item
+            if not text:
+                continue
+            if enqueue_research_text(text):
+                continue
+            self.reply_q.appendleft(item)
+
+        for item in interrupted:
+            text = item.get("text", "") if isinstance(item, dict) else item
+            if not text:
+                continue
+            if enqueue_research_text(text):
+                continue
+            fp = hashlib.md5((self.account.get("user_id", "") + "|" + text).encode("utf-8")).hexdigest()
+            if fp in replied_fps:
+                log(f"♻️ 跳过补回（已回复过）: {text[:30]}")
+                continue
+            log(f"♻️ 上次中断时正在处理的消息补回队列: {text[:40]}")
+            self.reply_q.appendleft(item)
+
+        for item in persisted_tasks:
+            if isinstance(item, dict) and item.get("research_task_id"):
+                task_id = str(item.get("research_task_id"))
+                job = self._research_jobs().get(task_id)
+                if (job and job.get("account_id") == self.account.get("account_id")
+                        and job.get("status") in {"queued", "archived"}
+                        and (job.get("status") != "archived"
+                             or self._research_ts(job.get("next_delivery_ts")) <= time.time())
+                        and task_id not in research_ids):
+                    job["queue_enqueued"] = True
+                    self.task_q.append({"research_task_id": task_id, "text": job.get("request", item.get("text", ""))})
+                    research_ids.add(task_id)
+                continue
+            text = item
+            if isinstance(item, str) and enqueue_research_text(text):
+                continue
+            if item:
+                self.task_q.append(item)
+
+    # ── durable research jobs ───────────────────────────────────────
+    def _research_jobs(self):
+        if not hasattr(self, "_research_lock"):
+            self._research_lock = threading.RLock()
+        jobs = self.state.setdefault("research_jobs", {})
+        if isinstance(jobs, list):
+            jobs = {str(j.get("task_id")): j for j in jobs if isinstance(j, dict) and j.get("task_id")}
+            self.state["research_jobs"] = jobs
+        return jobs
+
+    @staticmethod
+    def _research_now():
+        return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+    @staticmethod
+    def _research_ts(value):
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return 0.0
+
+    def _find_research_job(self, request_text, include_terminal=False):
+        with self._research_lock:
+            account = getattr(self, "account", {}) or {}
+            account_id = account.get("account_id") or ""
+            jobs = self._research_jobs()
+            candidates = [j for j in jobs.values()
+                          if j.get("request") == request_text
+                          and j.get("account_id") == account_id]
+            if not include_terminal:
+                candidates = [j for j in candidates if j.get("status") not in {"delivered", "failed", "cancelled"}]
+            candidates.sort(key=lambda j: j.get("created_ts", ""), reverse=True)
+            return candidates[0] if candidates else None
+
+    def _research_job_status(self, task_id=None, request_text=None):
+        """Return an account-scoped durable job snapshot for status/follow-up routing."""
+        with self._research_lock:
+            job = None
+            if task_id:
+                candidate = self._research_jobs().get(str(task_id))
+                account = getattr(self, "account", {}) or {}
+                if candidate and candidate.get("account_id") == (account.get("account_id") or ""):
+                    job = candidate
+            elif request_text:
+                job = self._find_research_job(request_text, include_terminal=True)
+            return dict(job) if job else None
+
+    def _research_is_cancelled(self, task_id):
+        if not task_id:
+            return False
+        with self._research_lock:
+            job = self._research_jobs().get(str(task_id))
+            return bool(job and (job.get("cancel_requested") or job.get("status") == "cancelled"))
+
+    def _retry_research_job(self, task_id):
+        """Explicitly restart a failed job or flush an archived delivery retry."""
+        with self._research_lock:
+            job = self._research_jobs().get(str(task_id))
+            account = getattr(self, "account", {}) or {}
+            if not job or job.get("account_id") != (account.get("account_id") or ""):
+                return None
+            if job.get("status") in {"archived", "delivery_ambiguous"}:
+                job["next_delivery_ts"] = self._research_now()
+                job["queue_enqueued"] = False
+                if job.get("status") == "delivery_ambiguous":
+                    delivery = job.setdefault("delivery", {})
+                    for kind in ("summary", "file", "completion"):
+                        if delivery.get(kind) in {"sending", "ambiguous"}:
+                            delivery[kind] = "pending"
+                    job["delivery_attempts"] = 0
+                    self._research_transition_locked(job, "archived", reason="explicit retry after ambiguous delivery",
+                                                      delivery_claim={"state": "pending"})
+                self.save_state()
+            elif job.get("status") in {"failed", "cancelled"}:
+                has_archive = bool(job.get("archive_paths"))
+                old_note = job.setdefault("failure_notification", {})
+                old_note["superseded"] = True
+                old_note["superseded_ts"] = self._research_now()
+                job["notification_generation"] = int(job.get("notification_generation") or 0) + 1
+                job["attempts"] = 0
+                job["delivery_attempts"] = 0
+                job["cancel_requested"] = False
+                job["failure_stage"] = ""
+                job["failure_reason"] = ""
+                job["failure_notification"] = {"state": "none",
+                                                "generation": job["notification_generation"],
+                                                "parts": []}
+                if has_archive:
+                    self._research_transition_locked(job, "archived", reason="explicit delivery retry",
+                                                      override_terminal=True,
+                                                      next_delivery_ts=self._research_now(), queue_enqueued=False)
+                else:
+                    self._research_transition_locked(job, "queued", reason="explicit retry", queue_enqueued=False,
+                                                      override_terminal=True,
+                                                      next_retry_ts=None)
+                self.save_state()
+            else:
+                return job
+        if job.get("status") == "archived":
+            self._research_queue_item(str(task_id), front=True)
+        elif job.get("status") == "queued":
+            self._research_queue_item(str(task_id), front=True)
+        return job
+
+    def _create_research_job(self, request_text, route=None):
+        """Register a research request before it enters either worker queue."""
+        with self._research_lock:
+            existing = self._find_research_job(request_text)
+            if existing:
+                return existing["task_id"]
+            task_id = "research-" + uuid.uuid4().hex[:16]
+            now = self._research_now()
+            account = getattr(self, "account", {}) or {}
+            job = {
+                "task_id": task_id,
+                "request": request_text,
+                "created_ts": now,
+                "account_id": account.get("account_id", ""),
+                "route": route or _research_request(request_text) or "unknown",
+                "status": "queued",
+                "attempts": 0,
+                "max_attempts": RESEARCH_MAX_ATTEMPTS,
+                "next_retry_ts": None,
+                "session_id": None,
+                "partial_findings": [],
+                "archive_paths": [],
+                "archive_target": None,
+                "summary": "",
+                "failure_stage": "",
+                "failure_reason": "",
+                "queue_enqueued": False,
+                "delivery": {"summary": "pending", "file": "pending", "completion": "pending"},
+                "notification_generation": 0,
+                "failure_notification": {"state": "none", "generation": 0, "parts": []},
+                "history": [],
+            }
+            self._research_jobs()[task_id] = job
+            self._research_transition_locked(job, "queued", reason="admitted")
+            self.save_state()
+            return task_id
+
+    def _research_transition_locked(self, job, status, reason="", override_terminal=False, **updates):
+        old = job.get("status")
+        if old in {"delivered", "failed", "cancelled"} and status != old and not override_terminal:
+            return False
+        if old == status and not updates:
+            return True
+        job.update(updates)
+        job["status"] = status
+        event = {"from": old, "to": status, "ts": self._research_now()}
+        if reason:
+            event["reason"] = str(reason)[:500]
+        history = job.setdefault("history", [])
+        history.append(event)
+        job["history"] = history[-40:]
+        return True
+
+    def _research_transition(self, task_id, status, reason="", override_terminal=False, **updates):
+        with self._research_lock:
+            job = self._research_jobs().get(task_id)
+            account = getattr(self, "account", {}) or {}
+            if not job or job.get("account_id") != (account.get("account_id") or ""):
+                return None
+            self._research_transition_locked(job, status, reason, override_terminal=override_terminal, **updates)
+            self.save_state()
+            return job
+
+    def _research_checkpoint(self, task_id, *, stage=None, error=None, session_id=None, partial=None):
+        if not task_id:
+            return
+        with self._research_lock:
+            job = self._research_jobs().get(task_id)
+            account = getattr(self, "account", {}) or {}
+            if not job or job.get("account_id") != (account.get("account_id") or ""):
+                return
+            if session_id:
+                job["session_id"] = session_id
+            if stage:
+                if stage != "completed":
+                    if stage not in {"progress", "partial", "session"}:
+                        try:
+                            from research_diagnostics import failure_stage
+                            stage = failure_stage(error, stage) if error else stage
+                        except Exception:
+                            pass
+                        job["failure_stage"] = stage
+                else:
+                    job["failure_stage"] = ""
+            if error:
+                try:
+                    from research_diagnostics import redact_diagnostic
+                    safe_error = redact_diagnostic(error)
+                except Exception:
+                    safe_error = re.sub(r"(?i)(token|sig(?:nature)?|cookie)[=:][^\s,;]+", r"\1=[REDACTED]", str(error))
+                job["failure_reason"] = str(safe_error)[:500]
+            if partial:
+                findings = job.setdefault("partial_findings", [])
+                value = str(partial)[:1000]
+                if not findings or findings[-1].get("text") != value:
+                    findings.append({"ts": self._research_now(), "stage": stage or "progress", "text": value})
+                job["partial_findings"] = findings[-12:]
+            self.save_state()
+
+    def _research_mark_running(self, task_id, session_id=None):
+        notify_failure = False
+        with self._research_lock:
+            job = self._research_jobs().get(task_id)
+            account = getattr(self, "account", {}) or {}
+            if not job or job.get("account_id") != (account.get("account_id") or ""):
+                return None
+            # A worker may claim only a queued research execution.  In
+            # particular, retry_wait is not an implicit bypass of backoff and
+            # running is never claimed a second time after a duplicate queue item.
+            if job.get("status") != "queued":
+                return None
+            if int(job.get("attempts") or 0) >= int(job.get("max_attempts") or RESEARCH_MAX_ATTEMPTS):
+                self._research_transition_locked(job, "failed", reason="retry exhaustion before claim",
+                                                  next_retry_ts=None, queue_enqueued=False,
+                                                  failure_stage=job.get("failure_stage") or "retry_limit",
+                                                  failure_reason=job.get("failure_reason") or "maximum attempts reached")
+                self.save_state()
+                notify_failure = True
+                result = None
+            else:
+                job["attempts"] = int(job.get("attempts") or 0) + 1
+                job["started_ts"] = self._research_now()
+                job["next_retry_ts"] = None
+                job["queue_enqueued"] = False
+                job["failure_stage"] = ""
+                job["failure_reason"] = ""
+                job["claim_token"] = uuid.uuid4().hex
+                self._research_transition_locked(job, "running", reason=f"attempt {job['attempts']}",
+                                                  session_id=session_id or job.get("session_id"))
+                self.save_state()
+                result = job
+        if notify_failure:
+            self._notify_research_failure(task_id)
+        return result
+
+    def _research_queue_item(self, task_id, front=False):
+        with self._research_lock:
+            job = self._research_jobs().get(task_id)
+            account = getattr(self, "account", {}) or {}
+            # Queue entries are the only handoff point between durable state
+            # and a worker.  Only an admission (queued) or an archived report
+            # waiting for delivery may enter it.  retry_wait is first moved to
+            # queued by the scheduler, preserving its persisted due time.
+            if (not job or job.get("account_id") != (account.get("account_id") or "")
+                    or job.get("status") not in {"queued", "archived"}):
+                return False
+            if job.get("status") == "archived" and self._research_ts(job.get("next_delivery_ts")) > time.time():
+                return False
+            if job.get("queue_enqueued"):
+                return False
+            job["queue_enqueued"] = True
+            item = {"research_task_id": task_id, "text": job.get("request", "")}
+            with self._task_cond:
+                if front:
+                    self.task_q.appendleft(item)
+                else:
+                    self.task_q.append(item)
+                self._task_cond.notify()
+            self.save_state()
+            return True
+
+    def _research_fail(self, task_id, stage, reason):
+        """Checkpoint a failed attempt and schedule bounded retry or terminal failure."""
+        try:
+            from research_diagnostics import redact_diagnostic
+            safe_reason = redact_diagnostic(reason)
+            try:
+                from research_diagnostics import failure_stage
+                stage = failure_stage(safe_reason, stage or "model_execution")
+            except Exception:
+                pass
+        except Exception:
+            safe_reason = re.sub(r"(?i)(token|sig(?:nature)?|cookie)[=:][^\s,;]+", r"\1=[REDACTED]", str(reason or ""))
+        with self._research_lock:
+            job = self._research_jobs().get(task_id)
+            account = getattr(self, "account", {}) or {}
+            if (not job or job.get("account_id") != (account.get("account_id") or "")
+                    or job.get("status") in {"delivered", "failed", "cancelled"}):
+                return job
+            job["failure_stage"] = str(stage or "unknown")[:120]
+            job["failure_reason"] = str(safe_reason or "unknown failure")[:500]
+            if job.get("cancel_requested"):
+                self._research_transition_locked(job, "cancelled", reason="user cancellation")
+                self.save_state()
+                return job
+            attempts = int(job.get("attempts") or 0)
+            if attempts < int(job.get("max_attempts") or RESEARCH_MAX_ATTEMPTS):
+                delay = min(RESEARCH_RETRY_MAX, RESEARCH_RETRY_BASE * (2 ** max(0, attempts - 1)))
+                next_ts = datetime.now(timezone.utc).timestamp() + delay
+                next_iso = datetime.fromtimestamp(next_ts, timezone.utc).replace(microsecond=0).isoformat()
+                self._research_transition_locked(job, "retry_wait", reason=f"attempt {attempts} failed",
+                                                  next_retry_ts=next_iso, queue_enqueued=False)
+                self.save_state()
+                log(f"调研任务 {task_id} 将在 {next_iso} 重试（{stage}: {safe_reason}）")
+                return job
+            self._research_transition_locked(job, "failed", reason="retry exhaustion", next_retry_ts=None)
+            self.save_state()
+        self._notify_research_failure(task_id)
+        return self._research_jobs().get(task_id)
+
+    def _research_mark_delivery(self, task_id):
+        """Atomically claim one delivery attempt before any external send."""
+        terminal = False
+        with self._research_lock:
+            job = self._research_jobs().get(task_id)
+            account = getattr(self, "account", {}) or {}
+            if not job or job.get("account_id") != (account.get("account_id") or ""):
+                return None
+            if job.get("status") == "delivering":
+                return None
+            if job.get("status") not in {"running", "archived"}:
+                return None
+            attempts = int(job.get("delivery_attempts") or 0) + 1
+            if attempts > RESEARCH_MAX_DELIVERY_ATTEMPTS:
+                self._research_transition_locked(job, "failed", reason="delivery retry exhaustion",
+                                                  failure_stage="wechat_delivery",
+                                                  failure_reason="maximum delivery attempts reached",
+                                                  next_delivery_ts=None, queue_enqueued=False)
+                self.save_state()
+                terminal = True
+                result = None
+            else:
+                job["delivery_attempts"] = attempts
+                job["delivery_claim"] = {"state": "sending", "attempt": attempts,
+                                          "ts": self._research_now()}
+                job["next_delivery_ts"] = None
+                self._research_transition_locked(job, "delivering", reason=f"delivery attempt {attempts}",
+                                                  queue_enqueued=False)
+                self.save_state()
+                result = job
+        if terminal:
+            self._notify_research_failure(task_id)
+        return result
+
+    def _research_delivery_failure(self, task_id, outcome, session_id=None):
+        """Bound delivery-only retries while retaining the archived report."""
+        if not task_id:
+            return
+        # A lost delivery claim belongs to another worker.  In particular, do
+        # not turn an active claimant's in-flight send into a retry merely
+        # because a duplicate queue item reached this method.
+        if getattr(outcome, "stage", None) == "delivery_claim":
+            return
+        try:
+            from research_diagnostics import redact_diagnostic
+            outcome_reason = str(redact_diagnostic(getattr(outcome, "reason", "") or ""))[:500]
+        except Exception:
+            outcome_reason = re.sub(r"(?i)(token|sig(?:nature)?|cookie)[^:=]*[=:][^\s,;]+",
+                                    r"\1=[REDACTED]", str(getattr(outcome, "reason", "") or ""))[:500]
+        terminal = False
+        with self._research_lock:
+            job = self._research_jobs().get(task_id)
+            account = getattr(self, "account", {}) or {}
+            if (not job or job.get("account_id") != (account.get("account_id") or "")
+                    or job.get("status") in {"delivered", "failed", "cancelled"}):
+                return
+            attempts = int(job.get("delivery_attempts") or 0)
+            if job.get("status") != "delivering":
+                attempts += 1
+            paths = outcome.get("archive_paths") or job.get("archive_paths") or []
+            if attempts >= RESEARCH_MAX_DELIVERY_ATTEMPTS:
+                self._research_transition_locked(job, "failed", reason="delivery retry exhaustion",
+                                                  session_id=session_id or job.get("session_id"),
+                                                  archive_paths=[str(p) for p in paths if p],
+                                                  delivery_attempts=attempts, next_delivery_ts=None,
+                                                  delivery_claim={"state": "failed", "attempt": attempts},
+                                                  failure_stage=("archive_processing"
+                                                                 if getattr(outcome, "stage", "") == "archive_processing"
+                                                                 else "wechat_delivery"),
+                                                  failure_reason=outcome_reason or "delivery failed")
+                terminal = True
+            else:
+                delay = min(RESEARCH_RETRY_MAX, RESEARCH_RETRY_BASE * (2 ** (attempts - 1)))
+                next_iso = datetime.fromtimestamp(time.time() + delay, timezone.utc).replace(microsecond=0).isoformat()
+                self._research_transition_locked(job, "archived", reason=outcome_reason or "delivery failed",
+                                                  session_id=session_id or job.get("session_id"),
+                                                  archive_paths=[str(p) for p in paths if p],
+                                                  delivery_attempts=attempts, next_delivery_ts=next_iso,
+                                                  delivery_claim={"state": "retry_wait", "attempt": attempts},
+                                                  failure_stage=("archive_processing"
+                                                                 if getattr(outcome, "stage", "") == "archive_processing"
+                                                                 else "wechat_delivery"),
+                                                  failure_reason=outcome_reason or "delivery failed")
+            self.save_state()
+        if terminal:
+            self._notify_research_failure(task_id)
+
+    def _research_recover_archive_paths(self, job):
+        """Recover a complete reserved report after a write-before-state crash.
+
+        ``archive_target`` is reserved before writing.  If the process dies
+        after the file is complete but before ``archive_paths``/``archived``
+        are persisted, the target is authoritative and the model must not be
+        run again.  This helper is deliberately read-only apart from returning
+        normalized paths; callers persist the result under the research lock.
+        """
+        paths = [str(p) for p in (job.get("archive_paths") or []) if p]
+        target = str(job.get("archive_target") or "")
+        if target:
+            try:
+                target_path = Path(target)
+                if target_path.exists() and target_path.is_file():
+                    body = target_path.read_text(encoding="utf-8")
+                    if _is_complete_research_report(body):
+                        if str(target_path) not in paths:
+                            paths.insert(0, str(target_path))
+                        txt_path = target_path.with_suffix(".txt")
+                        if txt_path.exists() and txt_path.is_file() and str(txt_path) not in paths:
+                            paths.append(str(txt_path))
+            except Exception:
+                pass
+        return list(dict.fromkeys(paths))
+
+    def _research_archived_report(self, task_id):
+        """Return durable report paths, including an uncommitted target file."""
+        with self._research_lock:
+            job = self._research_jobs().get(str(task_id))
+            account = getattr(self, "account", {}) or {}
+            if not job or job.get("account_id") != (account.get("account_id") or ""):
+                return []
+            paths = self._research_recover_archive_paths(job)
+            if paths != [str(p) for p in (job.get("archive_paths") or []) if p]:
+                job["archive_paths"] = paths
+                self.save_state()
+            # A path string alone is not evidence of a retained report.  Only
+            # a present, structurally complete Markdown file may divert an
+            # exception into delivery-only retry.
+            for candidate in paths:
+                try:
+                    candidate_path = Path(candidate)
+                    if (candidate_path.suffix.lower() == ".md" and candidate_path.exists()
+                            and _is_complete_research_report(
+                                candidate_path.read_text(encoding="utf-8"))):
+                        return paths
+                except Exception:
+                    continue
+            return []
+
+    def _research_post_archive_failure(self, task_id, reason, session_id=None):
+        """Schedule delivery/archive processing retry without rerunning research."""
+        paths = self._research_archived_report(task_id)
+        if not paths:
+            return False
+        try:
+            from research_diagnostics import redact_diagnostic
+            safe_reason = redact_diagnostic(reason)
+        except Exception:
+            safe_reason = re.sub(r"(?i)(token|sig(?:nature)?|cookie)[=:][^\s,;]+",
+                                 r"\1=[REDACTED]", str(reason or ""))
+        outcome = ResearchDeliveryOutcome(stage="archive_processing", reason=str(safe_reason)[:500],
+                                          archive_paths=paths)
+        self._research_delivery_failure(task_id, outcome, session_id=session_id)
+        return True
+
+    def _research_failure_text(self, job):
+        paths = [str(p) for p in (job.get("archive_paths") or []) if p]
+        saved = "已保存报告：" + ", ".join(paths) if paths else "没有保存完整报告"
+        partial_count = len(job.get("partial_findings") or [])
+        partial_location = f"{STATE_FILE}/{job.get('task_id')}"
+        if partial_count:
+            saved += f"；已保存 {partial_count} 条部分进展到 {partial_location}"
+        else:
+            saved += f"；没有保存部分结果（部分进展位置：{partial_location}）"
+        raw_created = str(job.get("created_ts") or "")
+        try:
+            created_dt = datetime.fromisoformat(raw_created.replace("Z", "+00:00"))
+            if created_dt.tzinfo is None:
+                created_dt = created_dt.replace(tzinfo=timezone.utc)
+            created = (created_dt.astimezone(timezone.utc).replace(microsecond=0)
+                       .isoformat().replace("+00:00", "Z"))
+        except Exception:
+            created = raw_created or "未知时间"
+        stage = _RESEARCH_STAGE_LABELS.get(job.get("failure_stage"), job.get("failure_stage") or "未知阶段")
+        model_attempts = int(job.get("attempts") or 0)
+        delivery_attempts = int(job.get("delivery_attempts") or 0)
+        return (f"“{_research_subject(job.get('request', '调研'))}”调研失败："
+                f"{stage}，{job.get('failure_reason') or '未返回结果'}。"
+                f"调研执行 {model_attempts} 轮，发送尝试 {delivery_attempts} 轮，暂不再自动重试。{saved}。"
+                f"任务 {job.get('task_id')}（{created}）；回复“重试”可重新开始。")
+
+    def _notify_research_failure(self, task_id):
+        with self._research_lock:
+            job = self._research_jobs().get(task_id)
+            account = getattr(self, "account", {}) or {}
+            if (not job or job.get("account_id") != (account.get("account_id") or "")
+                    or job.get("status") != "failed"):
+                return False
+            note = job.setdefault("failure_notification", {"state": "none"})
+            if note.get("superseded"):
+                return False
+            if note.get("state") == "sent":
+                return note.get("state") == "sent"
+            # A second notifier must not join or overwrite an active send.
+            # Restart recovery marks an interrupted send ambiguous; only an
+            # explicit retry can supersede that generation.
+            if note.get("state") in {"sending", "ambiguous"}:
+                return False
+            text = self._research_failure_text(job)
+            attempts = int(note.get("attempts") or 0) + 1
+            if attempts > RESEARCH_MAX_DELIVERY_ATTEMPTS:
+                note.update({"state": "outbox_exhausted", "text": text, "attempts": attempts})
+                self.save_state()
+                return False
+            generation = int(job.get("notification_generation") or note.get("generation") or 0)
+            claim_id = uuid.uuid4().hex
+            parts = _split_weixin_text(text)
+            note.update({"state": "sending", "text": text, "attempts": attempts,
+                         "created_ts": self._research_now(), "task_id": task_id,
+                         "account_id": job.get("account_id"), "generation": generation,
+                         "claim_id": claim_id,
+                         "parts": [{"index": index, "state": "pending", "generation": generation,
+                                    "claim_id": claim_id}
+                                   for index, _ in enumerate(parts)]})
+            self.save_state()
+        try:
+            ok = (self._send_research_message(text, task_id, "最终失败通知",
+                                               generation=generation, claim_id=claim_id)
+                  if isinstance(self, Bridge) else self.send_weixin(text))
+            sent = (ok is not False)
+        except Exception as exc:
+            log(f"调研最终失败通知发送异常: {str(exc)[:120]}")
+            sent = False
+        ack_applied = False
+        with self._research_lock:
+            job = self._research_jobs().get(task_id)
+            account = getattr(self, "account", {}) or {}
+            note = (job or {}).get("failure_notification") or {}
+            # Explicit retry can replace the note while the external send is
+            # still in flight.  Never acknowledge the old generation on the
+            # new cycle's note.
+            if (job and job.get("account_id") == (account.get("account_id") or "")
+                    and job.get("status") == "failed"
+                    and note.get("generation") == generation
+                    and note.get("claim_id") == claim_id
+                    and note.get("state") == "sending"):
+                note = job.setdefault("failure_notification", {})
+                note.update({"state": "sent" if sent else "pending",
+                             "sent_ts": self._research_now() if sent else None})
+                if not sent:
+                    note["next_retry_ts"] = datetime.fromtimestamp(
+                        time.time() + RESEARCH_RETRY_BASE * max(1, int(note.get("attempts") or 1)),
+                        timezone.utc).replace(microsecond=0).isoformat()
+                self.save_state()
+                ack_applied = True
+        return bool(sent and ack_applied)
+
+    def _restore_research_jobs(self):
+        """Turn persisted work into queue entries; no helper restart counts as a resume."""
+        with self._research_lock:
+            jobs = self._research_jobs()
+            now = time.time()
+            exhausted = []
+            for task_id, job in list(jobs.items()):
+                if job.get("account_id") != (self.account.get("account_id") or ""):
+                    continue
+                # A report target is reserved before its bytes are written.
+                # Recovering a complete target closes the crash window before
+                # the archive transition and prevents a second model run.
+                recovered_paths = self._research_recover_archive_paths(job)
+                stored_paths = [str(p) for p in (job.get("archive_paths") or []) if p]
+                if recovered_paths != stored_paths:
+                    job["archive_paths"] = recovered_paths
+                reserved_complete = False
+                try:
+                    target_path = Path(str(job.get("archive_target") or ""))
+                    reserved_complete = (bool(job.get("archive_target"))
+                                         and target_path.exists() and target_path.is_file()
+                                         and _is_complete_research_report(
+                                             target_path.read_text(encoding="utf-8")))
+                except Exception:
+                    reserved_complete = False
+                if (reserved_complete
+                        and recovered_paths
+                        and job.get("status") in {"running", "retry_wait", "queued"}):
+                    self._research_transition_locked(
+                        job, "archived", reason="recovered reserved archive target",
+                        archive_paths=recovered_paths, queue_enqueued=False,
+                        next_delivery_ts=self._research_now())
+                if job.get("status") == "delivering":
+                    # A process crash leaves the remote send ambiguous.  Do
+                    # not silently resend; require an explicit retry so the
+                    # user can choose between a possible duplicate and no
+                    # further delivery.
+                    delivery = job.setdefault("delivery", {})
+                    for kind in ("summary", "file", "completion"):
+                        if delivery.get(kind) == "sending":
+                            delivery[kind] = "ambiguous"
+                    self._research_transition_locked(job, "delivery_ambiguous",
+                                                      reason="bridge restarted during delivery",
+                                                      next_delivery_ts=None, queue_enqueued=False,
+                                                      delivery_claim={"state": "ambiguous",
+                                                                       "attempt": job.get("delivery_attempts", 0),
+                                                                       "ts": self._research_now()})
+                if job.get("status") == "failed":
+                    note = job.get("failure_notification") or {}
+                    if note.get("state") == "sending":
+                        note["state"] = "ambiguous"
+                        note["ambiguous_ts"] = self._research_now()
+                    elif note.get("state") in {None, "none"} and not note.get("superseded"):
+                        note["state"] = "pending"
+                        note["next_retry_ts"] = self._research_now()
+                if job.get("status") == "running":
+                    if int(job.get("attempts") or 0) >= int(job.get("max_attempts") or RESEARCH_MAX_ATTEMPTS):
+                        self._research_transition_locked(job, "failed", reason="retry exhaustion after restart",
+                                                          next_retry_ts=None, queue_enqueued=False,
+                                                          failure_stage="restart_recovery",
+                                                          failure_reason="bridge restarted after max attempts")
+                        exhausted.append(task_id)
+                    else:
+                        self._research_transition_locked(job, "retry_wait", reason="bridge restart recovery",
+                                                          next_retry_ts=self._research_now(), queue_enqueued=False,
+                                                          failure_stage="restart_recovery",
+                                                          failure_reason="bridge restarted during execution")
+                if job.get("status") == "retry_wait" and int(job.get("attempts") or 0) >= int(job.get("max_attempts") or RESEARCH_MAX_ATTEMPTS):
+                    self._research_transition_locked(job, "failed", reason="retry exhaustion",
+                                                      next_retry_ts=None, queue_enqueued=False)
+                    exhausted.append(task_id)
+                if job.get("status") == "retry_wait" and self._research_ts(job.get("next_retry_ts")) <= now:
+                    self._research_transition_locked(job, "queued", reason="retry due", queue_enqueued=False)
+                if job.get("status") == "queued":
+                    self._research_queue_item(task_id)
+                elif job.get("status") == "archived" and self._research_delivery_pending(job):
+                    self._research_queue_item(task_id)
+            # Legacy plain task entries remain ordinary tasks.  New research
+            # jobs are represented by task-id envelopes and are deduplicated.
+            self.save_state()
+        for task_id in exhausted:
+            self._notify_research_failure(task_id)
+
+    def _research_delivery_pending(self, job):
+        delivery = job.get("delivery") or {}
+        if all(delivery.get(k) == "sent" for k in ("summary", "file", "completion")):
+            return False
+        next_ts = job.get("next_delivery_ts")
+        return not next_ts or self._research_ts(next_ts) <= time.time()
+
+    def _research_retry_loop(self):
+        while True:
+            try:
+                due = []
+                now = time.time()
+                account = getattr(self, "account", {}) or {}
+                with self._research_lock:
+                    for task_id, job in self._research_jobs().items():
+                        if job.get("account_id") != (account.get("account_id") or ""):
+                            continue
+                        if job.get("status") == "retry_wait" and self._research_ts(job.get("next_retry_ts")) <= now:
+                            self._research_transition_locked(job, "queued", reason="retry due", queue_enqueued=False)
+                            due.append(task_id)
+                        elif job.get("status") == "archived" and self._research_delivery_pending(job):
+                            due.append(task_id)
+                        elif job.get("status") == "failed":
+                            note = job.get("failure_notification") or {}
+                            if (note.get("state") in {"pending", "none"}
+                                    and self._research_ts(note.get("next_retry_ts")) <= now):
+                                due.append((task_id, "failure_notification"))
+                    if due:
+                        self.save_state()
+                for item in due:
+                    if isinstance(item, tuple):
+                        self._notify_research_failure(item[0])
+                    else:
+                        self._research_queue_item(item)
+            except Exception as exc:
+                log(f"调研持久化调度异常: {str(exc)[:120]}")
+            time.sleep(RESEARCH_RETRY_POLL)
 
     def _prune_seen_fps(self, now=None):
         """Keep only recent content fingerprints for updates without message IDs."""
@@ -2751,6 +3671,7 @@ class Bridge:
         self.state["sync_buf"] = account.get("sync_buf", "")
         self.state["context_token"] = account.get("context_token", "")
         self.state["typing_ticket"] = account.get("typing_ticket", "")
+        self.state["boss_chat"] = ""
         self.state["codex_session"] = None
         self.state["session_account"] = account.get("account_id")
         clean = {k: v for k, v in account.items() if k in ("account_id", "token", "base_url", "user_id", "saved_at")}
@@ -2797,6 +3718,105 @@ class Bridge:
                 bus_notice("@用户 微信专线会话过期，自动重绑失败，请运行 register 扫码")
         except Exception as e:
             log(f"自动重绑线程异常: {e}")
+
+    def _research_followup_candidates(self, text, include_terminal=True):
+        account = getattr(self, "account", {}) or {}
+        raw = str(text or "")
+        task_match = re.search(r"research-[0-9a-f]{8,40}", raw, re.I)
+        with self._research_lock:
+            jobs = [j for j in self._research_jobs().values()
+                    if j.get("account_id") == (account.get("account_id") or "")]
+        if task_match:
+            return [j for j in jobs if j.get("task_id", "").lower() == task_match.group(0).lower()]
+        if not include_terminal:
+            jobs = [j for j in jobs if j.get("status") not in {"delivered", "failed", "cancelled"}]
+        if not jobs:
+            return []
+        jobs.sort(key=lambda j: j.get("created_ts", ""), reverse=True)
+        # A topic-bearing follow-up may select one job; a generic follow-up
+        # stays ambiguous when more than one account-scoped job is active.
+        compact = re.sub(r"[\s，。！？!?、,:：;；（）()【】\[\]]", "", raw)
+        scored = []
+        for job in jobs:
+            subject = _research_subject(job.get("request", ""))
+            pieces = [p for p in re.split(r"-+", subject) if len(p) >= 2]
+            score = max((len(piece) for piece in pieces if piece in compact), default=0)
+            if score:
+                scored.append((score, job))
+        if scored:
+            best = max(score for score, _ in scored)
+            return [job for score, job in scored if score == best]
+        active = [j for j in jobs if j.get("status") not in {"delivered", "failed", "cancelled"}]
+        return active or jobs
+
+    def _research_status_text(self, job):
+        labels = {
+            "queued": "已排队",
+            "running": "研究中",
+            "retry_wait": "等待下一次研究重试",
+            "archived": "报告已保存，等待微信发送",
+            "delivering": "正在发送报告",
+            "delivery_ambiguous": "发送结果不确定，等待你确认后重试",
+            "delivered": "已完成并发送",
+            "failed": "已失败，不再自动重试",
+            "cancelled": "已取消",
+        }
+        status = labels.get(job.get("status"), job.get("status", "未知"))
+        paths = [Path(p).name for p in (job.get("archive_paths") or []) if p]
+        saved = "；已保存 " + ", ".join(paths) if paths else "；没有保存完整报告"
+        partial = len(job.get("partial_findings") or [])
+        if partial:
+            saved += f"；部分进展 {partial} 条在任务记录中"
+        next_retry = job.get("next_retry_ts") or job.get("next_delivery_ts")
+        when = f"；下一次时间 {next_retry}" if next_retry else ""
+        return (f"任务 {job.get('task_id')}：{status}；研究尝试 {int(job.get('attempts') or 0)} 次，"
+                f"发送尝试 {int(job.get('delivery_attempts') or 0)} 次{when}{saved}。")
+
+    def _handle_research_followup(self, text):
+        """Handle status/retry/cancel follow-ups without invoking reminder/model routing."""
+        raw = str(text or "").strip()
+        norm = _norm_msg(raw)
+        task_id_present = bool(re.search(r"research-[0-9a-f]{8,40}", raw, re.I))
+        cancel = bool(re.search(r"(?:取消|停止|别再|不要再).*(?:调研|研究|任务)", raw)) or (
+            task_id_present and bool(re.search(r"(?:取消|停止)", raw)))
+        retry = (norm in {"重试", "再试一次", "继续调研"}
+                 or task_id_present and bool(re.search(r"(?:重试|再试一次)", raw))
+                 or bool(re.search(r"(?:重试|再试一次).*(?:调研|研究)", raw)))
+        status = (norm in {"有结果了吗", "调研还会继续吗", "调研进展", "调研状态", "任务状态", "报告呢"}
+                  or bool(re.search(r"(?:有结果了吗|调研还会继续吗|调研进展|调研状态|任务状态)", raw)))
+        if (_research_request(raw) and not task_id_present and not cancel and not status and not retry
+                and norm not in {"重试", "再试一次"}):
+            return False
+        if not (task_id_present or cancel or retry or status):
+            return False
+        include_terminal = status or retry or cancel
+        candidates = self._research_followup_candidates(raw, include_terminal=include_terminal)
+        if len(candidates) != 1:
+            if not candidates:
+                self.send_weixin("没有找到对应的调研任务。请提供任务编号（例如 research-xxxxxxxx）或先发起调研。")
+            else:
+                lines = ["找到多个调研任务，请回复任务编号："]
+                for job in candidates[:8]:
+                    lines.append(f"{job.get('task_id')} · {_research_subject(job.get('request', ''))} · {job.get('status')}")
+                self.send_weixin("\n".join(lines))
+            return True
+        job = candidates[0]
+        task_id = job.get("task_id")
+        if cancel:
+            updated = self._cancel_research_job(task_id)
+            self.send_weixin(f"已取消调研任务 {task_id}。" if updated else "这个调研任务已经结束，未再安排重试。")
+            return True
+        if retry:
+            updated = self._retry_research_job(task_id)
+            if not updated:
+                self.send_weixin("没有找到可重试的调研任务。")
+            elif updated.get("status") in {"queued", "archived"}:
+                self.send_weixin(f"已安排重试任务 {task_id}；当前状态：{self._research_status_text(updated)}")
+            else:
+                self.send_weixin(self._research_status_text(updated))
+            return True
+        self.send_weixin(self._research_status_text(job))
+        return True
 
     def handle_update(self, upd):
         if not isinstance(upd, dict):
@@ -2861,6 +3881,7 @@ class Bridge:
         raw = text.strip()
         if norm in STOP_PHRASES:
             stop_current_task()
+            self._cancel_research_jobs()
             self.send_weixin("好，已停下。")
             return
         if norm in STATUS_PHRASES:
@@ -2960,6 +3981,8 @@ class Bridge:
                 self.send_weixin("写入 Notion 失败，任务没有添加，请稍后重试。")
             self.save_state()
             return
+        if self._handle_research_followup(text):
+            return
         # 由 Codex 识别自然语言提醒；不依赖“几点提醒我”这类硬编码命令。
         self.send_typing()
         try:
@@ -2970,9 +3993,23 @@ class Bridge:
             log(f"提醒意图识别异常，继续普通对话: {str(e)[:120]}")
         level = classify_message(text)
         log(f"💬 收到消息（{level}）：{text[:30]}")
-        if _research_request(text):
+        research_route = _research_request(text)
+        if research_route:
             # Acknowledge immediately, before the request can wait in either worker queue.
             self.send_weixin("Okay, I'm starting to do the investigation.")
+            # Research is always admitted to the durable task queue, even when
+            # the generic classifier calls it a medium-sized chat turn.
+            task_id = self._create_research_job(text, research_route)
+            queued = self._research_queue_item(task_id)
+            if queued:
+                self.send_typing()
+                self.send_weixin(f"收到，调研任务已登记（任务 {task_id}），完成后我会发送结果。")
+            else:
+                job = self._research_jobs().get(task_id) or {}
+                if job.get("status") in {"running", "retry_wait", "queued"}:
+                    self.send_weixin(f"这个调研任务已在处理中（任务 {task_id}）。")
+            self.save_state()
+            return
         if level == "complex":
             # 复杂任务：进后台任务队列，最新任务优先（appendleft），不占聊天通道
             with self._task_cond:
@@ -3000,7 +4037,7 @@ class Bridge:
                     return entry.get("ticket", "")
             else:
                 return entry  # 旧格式字符串兼容
-        to = self.state["boss_chat"] or self.account.get("user_id", "")
+        to = self.state.get("boss_chat", "") or self.account.get("user_id", "")
         try:
             resp = _req(f"{self.account['base_url']}/{EP_GET_CONFIG}",
                         {"ilink_user_id": to, "context_token": self.state.get("context_token", "")},
@@ -3013,7 +4050,7 @@ class Bridge:
             return ""
 
     def send_typing(self):
-        to = self.state["boss_chat"] or self.account.get("user_id", "")
+        to = self.state.get("boss_chat", "") or self.account.get("user_id", "")
         ticket = self._get_typing_ticket()
         if not to or not ticket:
             return
@@ -3208,54 +4245,257 @@ class Bridge:
                 with _active_turns_lock:
                     self._chat_active -= 1
 
-    def _deliver_research_report(self, report, request_text, file_paths=()):
-        """Archive Markdown, then deliver its identical TXT copy plus a conclusion summary."""
-        requested_summary, _ = _split_research_reply(report)
-        report_body, source = _report_body_from_reply(report, file_paths)
-        if not _is_complete_research_report(report_body):
-            log("调研归档失败: 未收到完整报告正文，未保存或发送摘要文件")
-            self.send_weixin("调研报告归档失败：未收到完整报告正文（结论、调研范围和参考来源/笔记）。未生成 MD/TXT，请补充完整报告后重试。")
-            return True  # Failure was handled; do not send the raw envelope as a report.
-        if source:
-            log(f"调研归档采用 Agent 生成的完整报告: {source}")
-        reuse_source = (source and _is_relative_to(source, RESEARCH_ARCHIVE_DIR.resolve())
-                        and source.read_text(encoding="utf-8").strip() == report_body)
-        path = source if reuse_source else _save_research_report(report_body, request_text)
-        if not path:
-            self.send_weixin("调研报告归档失败：完整正文未能保存，未发送 TXT 文件。请重试。")
-            return True
-        txt_path = _save_research_text_copy(path)
-        summary = requested_summary or _fallback_research_summary(report_body)
-        try:
-            title = _research_subject(request_text)
-            _append_knowledge(f"{title} completed, reported {path.name}")
-        except Exception as e:
-            # Report delivery must still succeed if the optional knowledge update fails.
-            log(f"调研完成记录写入知识库失败: {str(e)[:120]}")
-        try:
-            self.send_weixin(summary)
-            if txt_path and self.send_file(str(txt_path)):
-                self.send_weixin(f"调研完成：已发送可在微信打开的 {txt_path.name}；Markdown 原件保存在本机：{path.name}")
-            elif txt_path:
-                self.send_weixin(f"Markdown 原件已保存为 {path.name}，但 TXT 文件发送失败。")
+    def _deliver_research_report(self, report, request_text, file_paths=(), task_id=None):
+        """Archive Markdown and deliver it with explicit archive/delivery outcomes.
+
+        Once a durable job reaches ``archived`` this method reuses its saved
+        paths and summary.  A transient WeChat failure therefore retries only
+        delivery; the model is never run again and no second Markdown report is
+        created.  The notification intent is persisted by the job before each
+        send.  WeChat has no idempotency key, so a process crash after a
+        successful remote send can still leave an ambiguous pending intent; the
+        state deliberately records that uncertainty instead of claiming
+        exactly-once delivery.
+        """
+        job = self._research_jobs().get(task_id) if task_id else None
+        if job and self._research_is_cancelled(task_id):
+            return ResearchDeliveryOutcome(stage="cancelled", reason="user cancellation")
+        if job and job.get("account_id") != (getattr(self, "account", {}) or {}).get("account_id"):
+            return ResearchDeliveryOutcome(stage="account", reason="job belongs to another account")
+        # A durable delivery invocation must own a fresh claim.  In-flight,
+        # failed, cancelled, or ambiguous jobs are not eligible and must not
+        # be allowed to send under another worker's claim.
+        if job and job.get("status") not in {"running", "archived"}:
+            return ResearchDeliveryOutcome(stage="delivery_claim", handled=False,
+                                           reason="delivery claim unavailable")
+        send_research = (lambda text, kind: self._send_research_message(text, task_id, kind)
+                         if isinstance(self, Bridge) else self.send_weixin(text))
+        delivery = (job.setdefault("delivery", {}) if job else {})
+        requested_summary, _ = _split_research_reply(report or "")
+        report_body, source = _report_body_from_reply(report or "", file_paths)
+        path = None
+        txt_path = None
+        if job:
+            # Include a complete reserved target even if the previous process
+            # died between the write and the archive transition/save.
+            recovered_paths = self._research_recover_archive_paths(job)
+            if recovered_paths != [str(p) for p in (job.get("archive_paths") or []) if p]:
+                with self._research_lock:
+                    current = self._research_jobs().get(task_id)
+                    if current:
+                        current["archive_paths"] = recovered_paths
+                        self.save_state()
+                job = self._research_jobs().get(task_id) or job
+            if job.get("archive_paths"):
+                paths = [Path(p) for p in job.get("archive_paths") if p]
             else:
-                self.send_weixin(f"Markdown 原件已保存为 {path.name}，但 TXT 副本创建失败。")
-        except Exception as e:
-            log(f"调研结果发送异常: {str(e)[:120]}")
-            self.send_weixin(f"Markdown 原件已保存为 {path.name}，但微信摘要或 TXT 发送失败。")
-        # Do not fall through to sending the full Markdown reply as chat text.
-        return True
+                paths = []
+            path = next((p for p in paths if p.suffix.lower() == ".md" and p.exists()), None)
+            txt_path = next((p for p in paths if p.suffix.lower() == ".txt" and p.exists()), None)
+            if path:
+                report_body = path.read_text(encoding="utf-8")
+        elif file_paths:
+            paths = [Path(p) for p in file_paths if p]
+        else:
+            paths = []
+        if not path:
+            if not _is_complete_research_report(report_body):
+                log("调研归档失败: 未收到完整报告正文，未保存或发送摘要文件")
+                send_research("调研报告归档失败：未收到完整报告正文（结论、调研范围和参考来源/笔记）。未生成 MD/TXT，请补充完整报告后重试。", "归档失败")
+                return ResearchDeliveryOutcome(stage="archive", reason="incomplete report body")
+            if source:
+                log(f"调研归档采用 Agent 生成的完整报告: {source}")
+            try:
+                reuse_source = (source and _is_relative_to(source, RESEARCH_ARCHIVE_DIR.resolve())
+                                and (not job or str(source) == str(job.get("archive_target") or ""))
+                                and source.read_text(encoding="utf-8").strip() == report_body)
+            except Exception:
+                reuse_source = False
+            target = None
+            if job:
+                with self._research_lock:
+                    current = self._research_jobs().get(task_id)
+                    if current and not current.get("archive_target"):
+                        current["archive_target"] = str(_research_archive_target(request_text, task_id))
+                        self.save_state()
+                    target = (current or {}).get("archive_target")
+            if job and self._research_is_cancelled(task_id):
+                return ResearchDeliveryOutcome(stage="cancelled", reason="user cancellation")
+            path = source if reuse_source else _save_research_report(report_body, request_text, target_path=target)
+            if not path:
+                send_research("调研报告归档失败：完整正文未能保存，未发送 TXT 文件。请重试。", "归档失败")
+                return ResearchDeliveryOutcome(stage="archive", reason="report archive failed")
+            if job:
+                self._research_transition(task_id, "archived", reason="report archived",
+                                          archive_paths=[str(path)], archive_target=str(path),
+                                          summary=requested_summary or _fallback_research_summary(report_body))
+        if job:
+            if self._research_is_cancelled(task_id):
+                return ResearchDeliveryOutcome(stage="cancelled", reason="user cancellation",
+                                               archive_paths=[path] if path else ())
+            current = self._research_jobs().get(task_id) or {}
+            if current.get("status") not in {"running", "archived"}:
+                return ResearchDeliveryOutcome(stage="delivery_claim", handled=False,
+                                               reason="delivery claim unavailable",
+                                               archive_paths=[path] if path else ())
+            if not self._research_mark_delivery(task_id):
+                return ResearchDeliveryOutcome(stage="delivery_claim", handled=False,
+                                               reason="delivery claim unavailable",
+                                               archive_paths=[path] if path else ())
+            job = self._research_jobs().get(task_id) or job
+            delivery = job.setdefault("delivery", {})
+        if not txt_path:
+            if job and self._research_is_cancelled(task_id):
+                return ResearchDeliveryOutcome(stage="cancelled", reason="user cancellation", archive_paths=[path])
+            txt_path = _save_research_text_copy(path)
+            if txt_path and job:
+                paths = list(job.get("archive_paths") or [])
+                if str(txt_path) not in paths:
+                    paths.append(str(txt_path))
+                self._research_checkpoint(task_id, partial=f"archived: {path}")
+                with self._research_lock:
+                    current = self._research_jobs().get(task_id)
+                    if current:
+                        current["archive_paths"] = paths
+                        self.save_state()
+        summary = (job or {}).get("summary") or requested_summary or _fallback_research_summary(report_body)
+        if job and not job.get("knowledge_recorded"):
+            try:
+                title = _research_subject(request_text)
+                _append_knowledge(f"{title} completed, reported {path.name}")
+                self._research_transition(task_id, job.get("status", "archived"), reason="knowledge recorded",
+                                          knowledge_recorded=True)
+            except Exception as e:
+                log(f"调研完成记录写入知识库失败: {str(e)[:120]}")
+        elif not job:
+            try:
+                title = _research_subject(request_text)
+                _append_knowledge(f"{title} completed, reported {path.name}")
+            except Exception as e:
+                log(f"调研完成记录写入知识库失败: {str(e)[:120]}")
+
+        summary_sent = delivery.get("summary") == "sent"
+        file_sent = delivery.get("file") == "sent"
+        completion_sent = delivery.get("completion") == "sent"
+        if not summary_sent:
+            if job and self._research_is_cancelled(task_id):
+                return ResearchDeliveryOutcome(stage="cancelled", reason="user cancellation",
+                                               archive_paths=[path, txt_path])
+            if job:
+                with self._research_lock:
+                    delivery["summary"] = "sending"
+                    delivery["summary_intent"] = summary
+                    self.save_state()
+            try:
+                result = send_research(summary, "摘要")
+                summary_sent = result is not False
+            except Exception as exc:
+                log(f"调研摘要发送异常: {str(exc)[:120]}")
+            if job:
+                delivery["summary"] = "sent" if summary_sent else "pending"
+        if not file_sent:
+            if job and self._research_is_cancelled(task_id):
+                return ResearchDeliveryOutcome(stage="cancelled", reason="user cancellation",
+                                               archive_paths=[path, txt_path], summary_sent=summary_sent)
+            if not txt_path:
+                delivery["file"] = "failed"
+            else:
+                if job:
+                    with self._research_lock:
+                        delivery["file"] = "sending"
+                        delivery["file_intent"] = str(txt_path)
+                        self.save_state()
+                try:
+                    file_sent = bool(self.send_file(str(txt_path), task_id=task_id)
+                                     if isinstance(self, Bridge)
+                                     else self.send_file(str(txt_path)))
+                except Exception as exc:
+                    log(f"调研 TXT 发送异常: {str(exc)[:120]}")
+                    file_sent = False
+                if job:
+                    delivery["file"] = "sent" if file_sent else "pending"
+        if summary_sent and file_sent and not completion_sent:
+            if job and self._research_is_cancelled(task_id):
+                return ResearchDeliveryOutcome(stage="cancelled", reason="user cancellation",
+                                               archive_paths=[path, txt_path], summary_sent=summary_sent,
+                                               file_sent=file_sent)
+            completion = f"调研完成：已发送可在微信打开的 {txt_path.name}；Markdown 原件保存在本机：{path.name}"
+            if job:
+                with self._research_lock:
+                    delivery["completion"] = "sending"
+                    delivery["completion_intent"] = completion
+                    self.save_state()
+            try:
+                result = send_research(completion, "完成通知")
+                completion_sent = result is not False
+            except Exception as exc:
+                log(f"调研完成通知发送异常: {str(exc)[:120]}")
+            if job:
+                delivery["completion"] = "sent" if completion_sent else "pending"
+        elif summary_sent and not file_sent:
+            note = (f"Markdown 原件已保存为 {path.name}，但 TXT 文件发送失败。"
+                    if txt_path else f"Markdown 原件已保存为 {path.name}，但 TXT 副本创建失败。")
+            if job:
+                with self._research_lock:
+                    delivery["completion"] = "sending"
+                    delivery["completion_intent"] = note
+                    self.save_state()
+            try:
+                note_sent = send_research(note, "失败说明") is not False
+            except Exception as exc:
+                log(f"调研失败说明发送异常: {str(exc)[:120]}")
+                note_sent = False
+            if job:
+                delivery["completion"] = "sent" if note_sent else "pending"
+        if job:
+            with self._research_lock:
+                current = self._research_jobs().get(task_id)
+                if current:
+                    current["delivery"] = delivery
+                    current["summary"] = summary
+                    current["archive_paths"] = list(dict.fromkeys(current.get("archive_paths") or [str(path)]))
+                    self.save_state()
+        complete = summary_sent and file_sent and completion_sent
+        if complete:
+            return ResearchDeliveryOutcome(success=True, stage="delivered", reason="",
+                                           archive_paths=[path, txt_path], summary_sent=True,
+                                           file_sent=True, notification_sent=True)
+        return ResearchDeliveryOutcome(success=False, stage="delivery", reason="one or more delivery steps failed",
+                                       archive_paths=[path, txt_path], summary_sent=summary_sent,
+                                       file_sent=file_sent, notification_sent=completion_sent)
 
     def _process_one(self, text):
+        if not hasattr(self, "_research_lock"):
+            self._research_lock = threading.RLock()
         with _active_turns_lock:
             parallel = self._chat_active > 1
             token = uuid.uuid4().hex
             _active_turns.add(token)
         self.state.setdefault("processing", []).append(text)
         self.save_state()
+        research_task_id = None
         try:
             level = classify_message(text)
             research_route = _research_request(text)
+            if research_route:
+                research_task_id = self._create_research_job(text, research_route)
+                if level == "complex":
+                    self._research_queue_item(research_task_id, front=True)
+                    return
+                existing = self._research_jobs().get(research_task_id) or {}
+                if existing.get("status") == "archived":
+                    if self._research_ts(existing.get("next_delivery_ts")) > time.time():
+                        return
+                    outcome = self._deliver_research_report("", text, (), task_id=research_task_id)
+                    if outcome.success:
+                        self._research_transition(research_task_id, "delivered", reason="archived report delivered")
+                    elif outcome.stage == "delivery_claim":
+                        return
+                    elif outcome.stage.startswith("delivery") or outcome.stage == "archive_processing":
+                        self._research_delivery_failure(research_task_id, outcome)
+                    return
+                if not self._research_mark_running(research_task_id, self.state.get("codex_session")):
+                    return
             if level == "complex":
                 # 兜底：复杂任务一律转后台任务队列（最新优先），不占聊天通道
                 with self._task_cond:
@@ -3277,22 +4517,53 @@ class Bridge:
                       + SYSTEM_HINT.format(identity=identity) + research_hint + text)
             base_prompt = PRIMER.format(identity=identity) if not sid else ""
             on_progress = self.send_weixin
+            if research_task_id:
+                def on_progress(progress_text):
+                    self._research_checkpoint(research_task_id, stage="progress", partial=progress_text)
+                    self.send_weixin(progress_text)
             cfg = self.backend_cfg or {}
             chat_model = cfg.get("chat_model") or CHAT_MODEL
             chat_effort = cfg.get("chat_effort") or CHAT_EFFORT
             casual_effort = cfg.get("casual_effort") or CASUAL_EFFORT
             # 简单消息降推理档省 token；普通对话用 chat 档；复杂任务由 _process_task 用 task 档处理
             turn_model, turn_effort = (chat_model, casual_effort if level == "casual" else chat_effort)
-            turn_timeout = TURN_HANG_TIMEOUT_TASK if level == "complex" else TURN_HANG_TIMEOUT
+            turn_timeout = RESEARCH_HANG_TIMEOUT if research_route else TURN_HANG_TIMEOUT
+            deadline = time.monotonic() + RESEARCH_TOTAL_TIMEOUT if research_route else None
+            checkpoint = (lambda event: self._research_checkpoint(
+                research_task_id, stage=event.get("stage"), error=event.get("error"),
+                session_id=event.get("session_id"), partial=event.get("partial"))) if research_task_id else None
+            cancel_check = (lambda: self._research_is_cancelled(research_task_id)) if research_task_id else None
             reply, new_sid = agent_reply(self.backend, prompt, sid, on_progress=on_progress,
                                          cfg=self.backend_cfg, model=turn_model, effort=turn_effort,
-                                         base=base_prompt or None, timeout=turn_timeout)
+                                         base=base_prompt or None, timeout=turn_timeout, deadline=deadline,
+                                         checkpoint=checkpoint, cancel_check=cancel_check)
             if not parallel and new_sid:
                 self.state["codex_session"] = new_sid
                 self.state["session_account"] = self.account.get("account_id")
+            if research_task_id and new_sid:
+                self._research_checkpoint(research_task_id, session_id=new_sid)
             if reply:
                 reply, files = _extract_files(reply)
-                report_sent = research_route and (reply.strip() or files) and self._deliver_research_report(reply, text, files)
+                outcome = (self._deliver_research_report(reply, text, files, task_id=research_task_id)
+                           if research_route and (reply.strip() or files) else None)
+                report_handled = outcome is not None
+                report_sent = bool(outcome) if outcome is not None else False
+                if research_task_id and outcome is not None:
+                    if outcome.stage == "cancelled":
+                        self._research_transition(research_task_id, "cancelled", reason=outcome.reason,
+                                                  cancel_requested=True, next_delivery_ts=None)
+                    elif outcome.success:
+                        self._research_transition(research_task_id, "delivered", reason="report delivered",
+                                                  session_id=new_sid or sid)
+                    elif outcome.stage == "delivery_claim":
+                        # Another worker owns the unique send claim.  Do not
+                        # mutate its retry state or fall back to a duplicate
+                        # raw-report message.
+                        pass
+                    elif outcome.stage in {"delivery", "archive_processing"}:
+                        self._research_delivery_failure(research_task_id, outcome, new_sid or sid)
+                    else:
+                        self._research_fail(research_task_id, outcome.stage or "archive", outcome.reason)
                 if not research_route:
                     for fp in files:
                         p = Path(fp).expanduser()
@@ -3307,10 +4578,10 @@ class Bridge:
                         except Exception as e:
                             log(f"发送文件异常: {str(e)[:120]}")
                             self.send_weixin(f"文件发送失败：{str(e)[:80]}")
-                if reply.strip() and not report_sent:
+                if reply.strip() and not report_handled:
                     self.send_weixin(reply)
                     self._mark_replied(text)
-                elif report_sent:
+                elif report_sent and (not outcome or outcome.success):
                     self._mark_replied(text)
                 if not parallel:
                     self._record_session(new_sid, text)
@@ -3318,12 +4589,25 @@ class Bridge:
                 self.save_state()
             elif _cancel_event.is_set():
                 log("⏹ 任务被 /stop 停止")
+                if research_task_id:
+                    self._research_transition(research_task_id, "cancelled", reason="user cancellation",
+                                              cancel_requested=True)
                 _cancel_event.clear()
             else:
-                self.send_weixin("（暂时连不上模型服务，稍后再问我一次）")
+                if research_task_id:
+                    current = self._research_jobs().get(research_task_id) or {}
+                    self._research_fail(research_task_id, current.get("failure_stage") or "model_execution",
+                                        current.get("failure_reason") or "backend returned no report")
+                else:
+                    self.send_weixin("（暂时连不上模型服务，稍后再问我一次）")
         except Exception as e:
             log(f"⚠️ 回复线程异常: {e}")
+            if research_task_id:
+                if not self._research_post_archive_failure(research_task_id, str(e)):
+                    self._research_fail(research_task_id, "bridge", str(e))
         finally:
+            if getattr(self, "_running_task", {}).get("desc") == text:
+                self._running_task.update({"active": False, "req_id": None})
             with _active_turns_lock:
                 _active_turns.discard(token)
             try:
@@ -3338,27 +4622,67 @@ class Bridge:
             with self._task_cond:
                 while not self.task_q:
                     self._task_cond.wait()
-                text = self.task_q.popleft()
+                item = self.task_q.popleft()
+            if isinstance(item, dict):
+                task_id = item.get("research_task_id")
+                text = item.get("text", "")
+                if task_id:
+                    with self._research_lock:
+                        job = self._research_jobs().get(task_id)
+                        account = getattr(self, "account", {}) or {}
+                        if (not job or job.get("account_id") != (account.get("account_id") or "")
+                                or job.get("status") not in {"queued", "archived"}
+                                or (job.get("status") == "archived"
+                                    and self._research_ts(job.get("next_delivery_ts")) > time.time())):
+                            continue
+                        job["queue_enqueued"] = False
+                        self.save_state()
+            else:
+                task_id = None
+                text = item
             try:
-                self._process_task(text)
+                self._process_task(text, task_id=task_id)
             except Exception as e:
                 log(f"⚠️ 任务线程异常: {e}")
 
-    def _process_task(self, text):
+    def _process_task(self, text, task_id=None):
         """后台执行复杂任务；聊天打断时保存恢复标记，聊天结束后自动续做。"""
+        if not hasattr(self, "_research_lock"):
+            self._research_lock = threading.RLock()
         preempt_evt = self._task_preempt
         preempt_ctx = self._running_task   # codex_reply 会把当前 turn 的 req_id 实时写进来
+        research_route = _research_request(text)
+        if research_route and not task_id:
+            task_id = self._create_research_job(text, research_route)
+        if research_route and task_id:
+            existing = self._research_jobs().get(task_id) or {}
+            if existing.get("status") == "archived":
+                if self._research_ts(existing.get("next_delivery_ts")) > time.time():
+                    return
+                outcome = self._deliver_research_report("", text, (), task_id=task_id)
+                if outcome.success:
+                    self._research_transition(task_id, "delivered", reason="archived report delivered")
+                elif outcome.stage == "delivery_claim":
+                    return
+                elif outcome.stage.startswith("delivery") or outcome.stage == "archive_processing":
+                    self._research_delivery_failure(task_id, outcome)
+                return
+        if research_route and task_id:
+            if not self._research_mark_running(task_id):
+                return
         resume_sid = None
         if self._resume_task and self._resume_task.get("desc") == text:
             resume_sid = self._resume_task.pop("sid", None)
             self._resume_task = None
+        if research_route and task_id:
+            job = self._research_jobs().get(task_id) or {}
+            resume_sid = resume_sid or job.get("session_id")
         with _active_turns_lock:
             token = uuid.uuid4().hex
             _active_turns.add(token)
         self.state.setdefault("processing", []).append(text)
         self.save_state()
         try:
-            research_route = _research_request(text)
             identity = BACKEND_IDENTITY.get(self.backend, "Codex")
             mem = _load_memory()
             memory_block = ("【微信桥记忆】\n" + mem + "\n\n") if mem else ""
@@ -3390,17 +4714,34 @@ class Bridge:
             task_effort = cfg.get("task_effort") or TASK_EFFORT
             chat_model = cfg.get("chat_model") or CHAT_MODEL
             chat_effort = cfg.get("chat_effort") or CHAT_EFFORT
-            reply, new_sid = agent_reply(self.backend, prompt, sid, on_progress=self.send_weixin,
+            turn_timeout = RESEARCH_HANG_TIMEOUT if research_route else TURN_HANG_TIMEOUT_TASK
+            deadline = time.monotonic() + RESEARCH_TOTAL_TIMEOUT if research_route else None
+            checkpoint = (lambda event: self._research_checkpoint(
+                task_id, stage=event.get("stage"), error=event.get("error"),
+                session_id=event.get("session_id"), partial=event.get("partial"))) if task_id else None
+            cancel_check = (lambda: self._research_is_cancelled(task_id)) if task_id else None
+            on_progress = self.send_weixin
+            if task_id:
+                def on_progress(progress_text):
+                    self._research_checkpoint(task_id, stage="progress", partial=progress_text)
+                    self.send_weixin(progress_text)
+            reply, new_sid = agent_reply(self.backend, prompt, sid, on_progress=on_progress,
                                          cfg=self.backend_cfg, model=task_model, effort=task_effort,
-                                         base=base_prompt or None, timeout=TURN_HANG_TIMEOUT_TASK,
-                                         preempt_evt=preempt_evt, preempt_ctx=preempt_ctx)
-            if not reply and not preempt_evt.is_set() and not _cancel_event.is_set():
+                                         base=base_prompt or None, timeout=turn_timeout, deadline=deadline,
+                                         preempt_evt=preempt_evt, preempt_ctx=preempt_ctx,
+                                         checkpoint=checkpoint, cancel_check=cancel_check)
+            if (not reply and not preempt_evt.is_set() and not _cancel_event.is_set()
+                    and not _backend_cancelled(cancel_check)
+                    and (deadline is None or time.monotonic() < deadline)):
                 # task 档失败：用 chat 档重试一次（配置不同即降档；相同也是多一次瞬时错误兜底）
                 log("↩️ task 档失败，用 chat 档重试一次")
-                reply, new_sid = agent_reply(self.backend, prompt, sid, on_progress=self.send_weixin,
+                reply, new_sid = agent_reply(self.backend, prompt, sid, on_progress=on_progress,
                                              cfg=self.backend_cfg, model=chat_model, effort=chat_effort,
-                                             base=base_prompt or None, timeout=TURN_HANG_TIMEOUT_TASK,
-                                             preempt_evt=preempt_evt, preempt_ctx=preempt_ctx)
+                                             base=base_prompt or None, timeout=turn_timeout, deadline=deadline,
+                                             preempt_evt=preempt_evt, preempt_ctx=preempt_ctx,
+                                             checkpoint=checkpoint, cancel_check=cancel_check)
+            if task_id and new_sid:
+                self._research_checkpoint(task_id, session_id=new_sid)
             self._running_task.update({"active": False, "sid": new_sid or sid, "req_id": None})
             if preempt_evt.is_set():
                 # 被打断：保存恢复标记，等聊天清空后放回队首自动续做
@@ -3410,13 +4751,37 @@ class Bridge:
                 deadline = time.time() + 180
                 while (self.reply_q or self._chat_active > 0) and time.time() < deadline:
                     time.sleep(0.5)
-                with self._task_cond:
-                    self.task_q.appendleft(text)
-                    self._task_cond.notify()
+                if task_id:
+                    self._research_transition(task_id, "retry_wait", reason="preempted by chat",
+                                              next_retry_ts=self._research_now(), queue_enqueued=False)
+                    self._research_transition(task_id, "queued", reason="resume after chat", queue_enqueued=False)
+                    self._research_queue_item(task_id, front=True)
+                else:
+                    with self._task_cond:
+                        self.task_q.appendleft(text)
+                        self._task_cond.notify()
                 return
             if reply:
                 reply, files = _extract_files(reply)
-                report_sent = research_route and (reply.strip() or files) and self._deliver_research_report(reply, text, files)
+                outcome = (self._deliver_research_report(reply, text, files, task_id=task_id)
+                           if research_route and (reply.strip() or files) else None)
+                report_handled = outcome is not None
+                report_sent = bool(outcome) if outcome is not None else False
+                if task_id and outcome is not None:
+                    if outcome.stage == "cancelled":
+                        self._research_transition(task_id, "cancelled", reason=outcome.reason,
+                                                  cancel_requested=True, next_delivery_ts=None)
+                    elif outcome.success:
+                        self._research_transition(task_id, "delivered", reason="report delivered",
+                                                  session_id=new_sid or sid)
+                    elif outcome.stage == "delivery_claim":
+                        pass
+                    elif outcome.stage.startswith("delivery") or outcome.stage == "archive_processing":
+                        # Archive succeeded before a delivery fault: the retry
+                        # scheduler only retries delivery and never reruns model work.
+                        self._research_delivery_failure(task_id, outcome, new_sid or sid)
+                    else:
+                        self._research_fail(task_id, outcome.stage or "archive", outcome.reason)
                 if not research_route:
                     for fp in files:
                         p = Path(fp).expanduser()
@@ -3431,18 +4796,31 @@ class Bridge:
                         except Exception as e:
                             log(f"发送文件异常: {str(e)[:120]}")
                             self.send_weixin(f"文件发送失败：{str(e)[:80]}")
-                if reply.strip() and not report_sent:
+                if reply.strip() and not report_handled:
                     self.send_weixin(reply)
                     self._mark_replied(text)
-                elif report_sent:
+                elif report_sent and (not outcome or outcome.success):
                     self._mark_replied(text)
                 self._record_session(new_sid or sid, text)
                 _append_memory(f"- {datetime.now():%Y-%m-%d %H:%M} | 任务：{text[:60]} → 结果：{reply[:80]}")
             else:
-                self.send_weixin("（任务执行失败，稍后我重新试一次）")
+                if task_id:
+                    current = self._research_jobs().get(task_id) or {}
+                    job = self._research_fail(task_id, current.get("failure_stage") or "model_execution",
+                                              current.get("failure_reason") or "backend returned no report")
+                    if job and job.get("status") == "retry_wait":
+                        self.send_weixin(f"调研任务 {task_id} 暂未完成，将按计划重试。")
+                else:
+                    self.send_weixin("（任务执行失败，稍后我重新试一次）")
         except Exception as e:
             log(f"⚠️ 任务处理异常: {e}")
+            if task_id:
+                if not self._research_post_archive_failure(task_id, str(e),
+                                                          session_id=(self._running_task or {}).get("sid")):
+                    self._research_fail(task_id, "bridge", str(e))
         finally:
+            if getattr(self, "_running_task", {}).get("desc") == text:
+                self._running_task.update({"active": False, "req_id": None})
             with _active_turns_lock:
                 _active_turns.discard(token)
             try:
@@ -3467,6 +4845,36 @@ class Bridge:
                 _helper_send({"type": "interrupt"})
         except Exception:
             pass
+
+    def _cancel_research_jobs(self):
+        """Make explicit user cancellation durable and suppress future retries."""
+        with self._research_lock:
+            changed = False
+            for job in self._research_jobs().values():
+                if job.get("account_id") != (self.account.get("account_id") or ""):
+                    continue
+                if job.get("status") in {"queued", "running", "retry_wait", "delivering"} or (
+                        job.get("status") == "archived" and self._research_delivery_pending(job)):
+                    job["cancel_requested"] = True
+                    self._research_transition_locked(job, "cancelled", reason="user cancellation",
+                                                      next_retry_ts=None, queue_enqueued=False)
+                    changed = True
+            if changed:
+                self.save_state()
+
+    def _cancel_research_job(self, task_id):
+        with self._research_lock:
+            job = self._research_jobs().get(str(task_id))
+            account = getattr(self, "account", {}) or {}
+            if not job or job.get("account_id") != (account.get("account_id") or ""):
+                return None
+            job["cancel_requested"] = True
+            if job.get("status") not in {"delivered", "failed", "cancelled"}:
+                self._research_transition_locked(job, "cancelled", reason="user cancellation",
+                                                  next_retry_ts=None, next_delivery_ts=None,
+                                                  queue_enqueued=False)
+            self.save_state()
+            return job
 
     def _record_session(self, sid, text):
         if not sid:
@@ -3525,11 +4933,60 @@ class Bridge:
     def _send_message(self, part, to, ctx, timeout=20):
         return self._post_message([{"type": ITEM_TEXT, "text_item": {"text": part}}], to, ctx, timeout)
 
-    def send_file(self, path):
+    def _research_send_allowed(self, task_id, *, kind="delivery", generation=None, claim_id=None):
+        """Check ownership and the current durable send claim immediately before I/O."""
+        if not task_id:
+            return True
+        with self._research_lock:
+            job = self._research_jobs().get(str(task_id))
+            account = getattr(self, "account", {}) or {}
+            if not job or job.get("account_id") != (account.get("account_id") or ""):
+                return False
+            if job.get("cancel_requested") or job.get("status") == "cancelled":
+                return False
+            note = job.get("failure_notification") or {}
+            if kind in {"最终失败通知", "failure", "failure_notification"}:
+                return (job.get("status") == "failed"
+                        and note.get("state") == "sending"
+                        and note.get("generation") == generation
+                        and note.get("claim_id") == claim_id
+                        and not note.get("superseded"))
+            # Normal report sends are owned by the delivery claimant.  A hot
+            # account switch or explicit cancellation therefore stops before
+            # either upload or text-message I/O.
+            return job.get("status") == "delivering"
+
+    def _research_notification_part(self, task_id, generation, claim_id, index, state):
+        """Persist a failure-notification part state only for its live claim."""
+        with self._research_lock:
+            job = self._research_jobs().get(str(task_id))
+            account = getattr(self, "account", {}) or {}
+            note = (job or {}).get("failure_notification") or {}
+            if (not job or job.get("account_id") != (account.get("account_id") or "")
+                    or job.get("status") != "failed"
+                    or note.get("generation") != generation
+                    or note.get("claim_id") != claim_id
+                    or note.get("state") != "sending"):
+                return False
+            parts = note.setdefault("parts", [])
+            while len(parts) <= index:
+                parts.append({"index": len(parts), "state": "pending",
+                              "generation": generation, "claim_id": claim_id})
+            part = parts[index]
+            if (part.get("generation") != generation or part.get("claim_id") != claim_id):
+                return False
+            part.update({"state": state, "updated_ts": self._research_now()})
+            self.save_state()
+            return True
+
+    def send_file(self, path, task_id=None):
         """上传并发送文件/图片/视频/语音到微信。成功返回 True。"""
         p = Path(path)
         if not p.exists() or not p.is_file():
             log(f"发送文件不存在: {path}")
+            return False
+        if task_id and not self._research_send_allowed(task_id):
+            log(f"调研文件发送 ownership/状态检查失败: {task_id}")
             return False
         to = self.state["boss_chat"] or self.account.get("user_id", "")
         if not to:
@@ -3541,6 +4998,8 @@ class Bridge:
         else:
             media_type, kind = 3, "file"  # 视频/语音暂按文件通道发送（已验证的稳妥路径）
         try:
+            if task_id and not self._research_send_allowed(task_id):
+                return False
             ref = _upload_media(self.account["base_url"], self.account["token"], str(p), media_type, to)
         except Exception as e:
             log(f"文件上传失败: {str(e)[:120]}")
@@ -3557,9 +5016,13 @@ class Bridge:
                 "file_size": ref["file_size"], "media": {
                 "encrypt_query_param": ref["encrypt_query_param"],
                 "aes_key": aes_b64, "encrypt_type": 1}}}
+        if task_id and not self._research_send_allowed(task_id):
+            return False
         r = self._post_message([item], to, ctx, timeout=60)
         if r == "expired":
             log("发文件遇会话过期，去掉 context_token 重试")
+            if task_id and not self._research_send_allowed(task_id):
+                return False
             r = self._post_message([item], to, None, timeout=60)
         if r != "ok":
             log(f"发文件失败: {p.name} (rc={r})")
@@ -3567,22 +5030,65 @@ class Bridge:
         log(f"📎 已发文件: {p.name} ({kind})")
         return True
 
-    def send_weixin(self, text):
+    def _send_research_message(self, text, task_id=None, kind="delivery", generation=None, claim_id=None):
+        """Send a durable research outbox item without the generic retry queue."""
+        if not isinstance(self, Bridge):
+            # Unit-test doubles and narrow integrations may provide only the
+            # legacy send_weixin method.
+            return self.send_weixin(text)
+        if task_id and not self._research_send_allowed(task_id, kind=kind,
+                                                       generation=generation, claim_id=claim_id):
+            return False
         to = self.state["boss_chat"] or self.account.get("user_id", "")
-        ctx = self.state["context_token"]
+        if not to:
+            return False
+        ctx = self.state.get("context_token", "")
+        ok = True
+        for index, part in enumerate(_split_weixin_text(text)):
+            if task_id and not self._research_send_allowed(task_id, kind=kind,
+                                                           generation=generation, claim_id=claim_id):
+                return False
+            failure_part = kind in {"最终失败通知", "failure", "failure_notification"}
+            if failure_part and not self._research_notification_part(
+                    task_id, generation, claim_id, index, "sending"):
+                return False
+            r = self._send_message(part, to, ctx)
+            if r == "expired":
+                if task_id and not self._research_send_allowed(task_id, kind=kind,
+                                                               generation=generation, claim_id=claim_id):
+                    return False
+                r = self._send_message(part, to, None)
+            if r != "ok":
+                ok = False
+                if failure_part:
+                    self._research_notification_part(task_id, generation, claim_id, index, "pending")
+                log(f"调研{kind}发送失败，留在任务 outbox: {task_id or 'untracked'}")
+            elif failure_part and not self._research_notification_part(
+                    task_id, generation, claim_id, index, "sent"):
+                return False
+            time.sleep(1)
+        return ok
+
+    def send_weixin(self, text, research_task_id=None):
+        to = self.state.get("boss_chat", "") or self.account.get("user_id", "")
+        ctx = self.state.get("context_token", "")
         if not to:
             log("⚠️ 还不知道用户chat_id，回复暂缓")
-            return
+            return False
+        all_sent = True
         for part in _split_weixin_text(text):
             r = self._send_message(part, to, ctx)
             if r == "expired":
                 log("去掉 context_token 重试一次")
                 r = self._send_message(part, to, None)
             if r != "ok":
-                _save_to_retry_queue(to, part, None if r == "expired" else ctx)
+                all_sent = False
+                _save_to_retry_queue(to, part, None if r == "expired" else ctx,
+                                     research_task_id=research_task_id)
             else:
                 log(f"📤 已回微信: {part[:40]}")
             time.sleep(1)
+        return all_sent
 
     def _flush_retry_queue(self):
         if not RETRY_QUEUE_FILE.exists():
@@ -3602,6 +5108,15 @@ class Bridge:
                 remaining.append(line)
                 continue
             part = entry.get("text") or ""
+            task_id = entry.get("research_task_id")
+            if task_id:
+                with self._research_lock:
+                    job = self._research_jobs().get(task_id)
+                    if job and (job.get("status") in {"delivered", "cancelled"}
+                                or job.get("status") in {"queued", "running", "retry_wait", "archived", "delivering"}
+                                or (job.get("failure_notification") or {}).get("superseded")):
+                        log(f"♻️ 丢弃已被结果覆盖的调研发送重试: {task_id}")
+                        continue
             ctx = entry.get("context_token")
             to = entry.get("to") or self.state["boss_chat"] or self.account.get("user_id", "")
             if not part or not to:
@@ -3663,17 +5178,19 @@ class Bridge:
         t2a = threading.Thread(target=lambda: self._guarded("reply", self._reply_worker_loop), daemon=True)
         t2b = threading.Thread(target=lambda: self._guarded("reply", self._reply_worker_loop), daemon=True)
         t2c = threading.Thread(target=lambda: self._guarded("task", self._task_worker_loop), daemon=True)
+        t2d = threading.Thread(target=lambda: self._guarded("research-retry", self._research_retry_loop), daemon=True)
         t3 = threading.Thread(target=lambda: self._guarded("watchdog", self.watchdog), daemon=True)
         t4 = threading.Thread(target=lambda: self._guarded("reminder", self._reminder_loop), daemon=True)
         t1.start()
         t2a.start()
         t2b.start()
         t2c.start()
+        t2d.start()
         t3.start()
         t4.start()
         while True:
             time.sleep(60)
-            if not t1.is_alive() or not t2a.is_alive() or not t2b.is_alive() or not t2c.is_alive() or not t4.is_alive():
+            if not t1.is_alive() or not t2a.is_alive() or not t2b.is_alive() or not t2c.is_alive() or not t2d.is_alive() or not t4.is_alive():
                 log("⚠️ 子线程退出，重启桥进程")
                 os._exit(1)
 

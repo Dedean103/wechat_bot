@@ -46,6 +46,27 @@ class ResearchArchiveTests(unittest.TestCase):
     def test_split_discards_preamble_and_summary(self):
         self.assertEqual(bridge._split_research_reply(ENVELOPE), (SUMMARY, REPORT.strip()))
 
+    def test_trailing_chat_summary_cannot_discard_research(self):
+        raw = ENVELOPE + "\n【总结】\n" + SUMMARY
+        cleaned = bridge._clean_final(raw, set())
+        self.assertEqual(cleaned, raw)
+        self.assertTrue(self.deliver(cleaned))
+        md, = self.archive.glob("*.md")
+        self.assertIn(REPORT.strip(), md.read_text())
+        self.assertEqual(md.read_bytes(), md.with_suffix(".txt").read_bytes())
+        self.assertEqual(self.sender.send_weixin.call_args_list[0].args[0], SUMMARY)
+
+    def test_summary_can_start_on_marker_line(self):
+        raw = ENVELOPE.replace("【微信调研摘要】\n", "【微信调研摘要】")
+        self.assertEqual(bridge._split_research_reply(raw), (SUMMARY, REPORT.strip()))
+
+    def test_unenveloped_report_preserves_markdown_whitespace(self):
+        raw = REPORT + "\n```python\n    nested = True\n```\n\n【总结】\n摘要"
+        self.assertEqual(bridge._clean_final(raw, set()), raw.strip())
+
+    def test_ordinary_chat_still_extracts_summary(self):
+        self.assertEqual(bridge._clean_final("【进度】处理中\n【总结】\n你好", set()), "你好")
+
     def test_body_marker_without_summary_and_crlf(self):
         reply = ("前置说明\n## 【报告正文】\n" + REPORT).replace("\n", "\r\n")
         self.assertEqual(bridge._split_research_reply(reply)[0], "")

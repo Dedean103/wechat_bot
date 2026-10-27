@@ -116,6 +116,9 @@ async function startTurn(cmd) {
         ...(cmd.base ? { baseInstructions: cmd.base } : {}),
       });
       threadId = started.thread.id || started.thread || started.id;
+      // Persist the thread identity as soon as thread/start succeeds.  The
+      // bridge can checkpoint this before a long turn produces a result.
+      out({ type: "session", threadId, id: reqId });
     } else {
       try {
         await rpc("thread/resume", { threadId });
@@ -135,6 +138,7 @@ async function startTurn(cmd) {
     const turnId = res.turn && res.turn.id;
     if (turnId) {
       turns.set(turnId, { reqId, threadId, buffer: "", linebuf: "", sent: new Set() });
+      out({ type: "session", threadId, id: reqId });
     } else {
       out({ type: "error", message: "turn/start 未返回 turn.id", id: reqId });
     }
