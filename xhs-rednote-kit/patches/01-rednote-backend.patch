@@ -1,0 +1,447 @@
+diff --git a/configs/backend.go b/configs/backend.go
+new file mode 100644
+index 0000000..e518f9a
+--- /dev/null
++++ b/configs/backend.go
+@@ -0,0 +1,43 @@
++package configs
++
++import (
++	"os"
++	"strings"
++
++	"github.com/sirupsen/logrus"
++)
++
++const (
++	BackendXiaohongshu = "xiaohongshu"
++	BackendRednote     = "rednote"
++)
++
++// BackendFromEnv selects which web product the browser automation uses.
++// RedNote accounts have cookies scoped to .rednote.com and must not be
++// validated against xiaohongshu.com.
++func BackendFromEnv() string {
++	backend := strings.ToLower(strings.TrimSpace(os.Getenv("XHS_BACKEND")))
++	switch backend {
++	case "", BackendXiaohongshu:
++		return BackendXiaohongshu
++	case BackendRednote:
++		return BackendRednote
++	default:
++		logrus.Warnf("invalid XHS_BACKEND=%q, using %s", backend, BackendXiaohongshu)
++		return BackendXiaohongshu
++	}
++}
++
++func WebBaseURL() string {
++	if BackendFromEnv() == BackendRednote {
++		return "https://www.rednote.com"
++	}
++	return "https://www.xiaohongshu.com"
++}
++
++func CreatorBaseURL() string {
++	if BackendFromEnv() == BackendRednote {
++		return "https://creator.rednote.com"
++	}
++	return "https://creator.xiaohongshu.com"
++}
+diff --git a/configs/backend_test.go b/configs/backend_test.go
+new file mode 100644
+index 0000000..2c398d6
+--- /dev/null
++++ b/configs/backend_test.go
+@@ -0,0 +1,33 @@
++package configs
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++)
++
++func TestBackendURLs(t *testing.T) {
++	t.Run("default uses Xiaohongshu", func(t *testing.T) {
++		t.Setenv("XHS_BACKEND", "")
++		assert.Equal(t, BackendXiaohongshu, BackendFromEnv())
++		assert.Equal(t, "https://www.xiaohongshu.com", WebBaseURL())
++		assert.Equal(t, "https://creator.xiaohongshu.com", CreatorBaseURL())
++	})
++
++	t.Run("rednote uses RedNote domains", func(t *testing.T) {
++		t.Setenv("XHS_BACKEND", "rednote")
++		assert.Equal(t, BackendRednote, BackendFromEnv())
++		assert.Equal(t, "https://www.rednote.com", WebBaseURL())
++		assert.Equal(t, "https://creator.rednote.com", CreatorBaseURL())
++	})
++
++	t.Run("backend is case insensitive", func(t *testing.T) {
++		t.Setenv("XHS_BACKEND", " REDNOTE ")
++		assert.Equal(t, BackendRednote, BackendFromEnv())
++	})
++
++	t.Run("invalid backend falls back safely", func(t *testing.T) {
++		t.Setenv("XHS_BACKEND", "unknown")
++		assert.Equal(t, BackendXiaohongshu, BackendFromEnv())
++	})
++}
+diff --git a/xiaohongshu/backend_urls_test.go b/xiaohongshu/backend_urls_test.go
+new file mode 100644
+index 0000000..92a981e
+--- /dev/null
++++ b/xiaohongshu/backend_urls_test.go
+@@ -0,0 +1,24 @@
++package xiaohongshu
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestRednoteBackendURLs(t *testing.T) {
++	t.Setenv("XHS_BACKEND", "rednote")
++
++	urls := []string{
++		makeSearchURL("深圳粤菜"),
++		makeFeedDetailURL("feed-id", "token"),
++		makeUserProfileURL("user-id", "token"),
++		publishURL(),
++	}
++	for _, got := range urls {
++		require.True(t, strings.HasPrefix(got, "https://"), got)
++		require.Contains(t, got, ".rednote.com", got)
++		require.NotContains(t, got, ".xiaohongshu.com", got)
++	}
++}
+diff --git a/xiaohongshu/feed_detail.go b/xiaohongshu/feed_detail.go
+index 96b8d9d..1b05e00 100644
+--- a/xiaohongshu/feed_detail.go
++++ b/xiaohongshu/feed_detail.go
+@@ -14,6 +14,7 @@ import (
+ 	"github.com/go-rod/rod"
+ 	"github.com/go-rod/rod/lib/proto"
+ 	"github.com/sirupsen/logrus"
++	"github.com/xpzouying/xiaohongshu-mcp/configs"
+ 	"github.com/xpzouying/xiaohongshu-mcp/errors"
+ 	"github.com/xpzouying/xiaohongshu-mcp/humanize"
+ )
+@@ -988,5 +989,5 @@ func (f *FeedDetailAction) extractFeedDetail(page *rod.Page, feedID string) (*Fe
+ }
+ 
+ func makeFeedDetailURL(feedID, xsecToken string) string {
+-	return fmt.Sprintf("https://www.xiaohongshu.com/explore/%s?xsec_token=%s&xsec_source=pc_feed", feedID, xsecToken)
++	return fmt.Sprintf("%s/explore/%s?xsec_token=%s&xsec_source=pc_feed", configs.WebBaseURL(), feedID, xsecToken)
+ }
+diff --git a/xiaohongshu/feeds.go b/xiaohongshu/feeds.go
+index 5582ae6..2cafb98 100644
+--- a/xiaohongshu/feeds.go
++++ b/xiaohongshu/feeds.go
+@@ -7,6 +7,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/go-rod/rod"
++	"github.com/xpzouying/xiaohongshu-mcp/configs"
+ 	"github.com/xpzouying/xiaohongshu-mcp/errors"
+ )
+ 
+@@ -17,7 +18,7 @@ type FeedsListAction struct {
+ func NewFeedsListAction(page *rod.Page) *FeedsListAction {
+ 	pp := page.Timeout(60 * time.Second)
+ 
+-	pp.MustNavigate("https://www.xiaohongshu.com")
++	pp.MustNavigate(configs.WebBaseURL())
+ 	pp.MustWaitDOMStable()
+ 
+ 	return &FeedsListAction{page: pp}
+diff --git a/xiaohongshu/login.go b/xiaohongshu/login.go
+index 16e5bef..b93a40e 100644
+--- a/xiaohongshu/login.go
++++ b/xiaohongshu/login.go
+@@ -7,6 +7,8 @@ import (
+ 
+ 	"github.com/go-rod/rod"
+ 	"github.com/pkg/errors"
++	"github.com/sirupsen/logrus"
++	"github.com/xpzouying/xiaohongshu-mcp/configs"
+ )
+ 
+ type LoginAction struct {
+@@ -20,7 +22,7 @@ func NewLogin(page *rod.Page) *LoginAction {
+ func (a *LoginAction) CheckLoginStatus(ctx context.Context) (bool, error) {
+ 	// 加超时保护：只是查登录态的快速检查，不应无限挂（登录扫码的等待在 Login/WaitForLogin 里）
+ 	pp := a.page.Context(ctx).Timeout(30 * time.Second)
+-	pp.MustNavigate("https://www.xiaohongshu.com/explore").MustWaitLoad()
++	pp.MustNavigate(configs.WebBaseURL() + "/explore").MustWaitLoad()
+ 
+ 	time.Sleep(1 * time.Second)
+ 
+@@ -29,11 +31,60 @@ func (a *LoginAction) CheckLoginStatus(ctx context.Context) (bool, error) {
+ 		return false, errors.Wrap(err, "check login status failed")
+ 	}
+ 
+-	if !exists {
+-		return false, errors.Wrap(err, "login status element not found")
++	state, stateErr := readLoginPageState(pp)
++	if stateErr != nil {
++		logrus.Warnf("读取登录页状态失败: %v", stateErr)
++	} else {
++		logrus.Infof(
++			"登录诊断: url=%s sidebar=%t authenticated_state=%t guest=%t user_identity=%t login_button=%t login_modal=%t",
++			state.URL, exists, state.Authenticated, state.Guest, state.HasIdentity, state.HasLoginButton, state.HasLoginModal,
++		)
+ 	}
+ 
+-	return true, nil
++	return exists || (stateErr == nil && state.Authenticated), nil
++}
++
++// loginPageState 只保留诊断登录所需的布尔状态，不记录账号标识和 Cookie 值。
++type loginPageState struct {
++	URL            string `json:"url"`
++	Authenticated  bool   `json:"authenticated"`
++	Guest          bool   `json:"guest"`
++	HasIdentity    bool   `json:"hasIdentity"`
++	HasLoginButton bool   `json:"hasLoginButton"`
++	HasLoginModal  bool   `json:"hasLoginModal"`
++}
++
++func readLoginPageState(page *rod.Page) (loginPageState, error) {
++	res, err := page.Eval(`() => {
++		const unwrap = value => {
++			if (!value || typeof value !== "object") return value;
++			if (value.value !== undefined) return value.value;
++			if (value._value !== undefined) return value._value;
++			return value;
++		};
++		const user = window.__INITIAL_STATE__ && window.__INITIAL_STATE__.user;
++		const candidates = user ? [user.userInfo, user.currentUser, user.me] : [];
++		const info = candidates.map(unwrap).find(value => value && typeof value === "object") || null;
++		const guest = Boolean(info && info.guest === true);
++		const hasIdentity = Boolean(info && (info.userId || info.user_id || info.nickname));
++		return JSON.stringify({
++			url: location.href,
++			authenticated: Boolean(info && !guest && hasIdentity),
++			guest,
++			hasIdentity,
++			hasLoginButton: Boolean(document.querySelector("#login-btn")),
++			hasLoginModal: Boolean(document.querySelector(".login-container")),
++		});
++	}`)
++	if err != nil {
++		return loginPageState{}, errors.Wrap(err, "eval login page state failed")
++	}
++
++	var state loginPageState
++	if err := json.Unmarshal([]byte(res.Value.String()), &state); err != nil {
++		return loginPageState{}, errors.Wrap(err, "unmarshal login page state failed")
++	}
++	return state, nil
+ }
+ 
+ // CurrentUser 当前登录用户的基础信息。
+@@ -74,7 +125,7 @@ func (a *LoginAction) Login(ctx context.Context) error {
+ 	pp := a.page.Context(ctx)
+ 
+ 	// 导航到小红书首页，这会触发二维码弹窗
+-	pp.MustNavigate("https://www.xiaohongshu.com/explore").MustWaitLoad()
++	pp.MustNavigate(configs.WebBaseURL() + "/explore").MustWaitLoad()
+ 
+ 	// 等待一小段时间让页面完全加载
+ 	time.Sleep(2 * time.Second)
+@@ -95,8 +146,8 @@ func (a *LoginAction) Login(ctx context.Context) error {
+ func (a *LoginAction) FetchQrcodeImage(ctx context.Context) (string, bool, error) {
+ 	pp := a.page.Context(ctx)
+ 
+-	// 导航到小红书首页，这会触发二维码弹窗
+-	pp.MustNavigate("https://www.xiaohongshu.com/explore").MustWaitLoad()
++	// RedNote 首页不会稳定地自动弹出登录框，独立登录页与国内站二维码 DOM 一致。
++	pp.MustNavigate(loginPageURL()).MustWaitLoad()
+ 
+ 	// 等待一小段时间让页面完全加载
+ 	time.Sleep(2 * time.Second)
+@@ -118,6 +169,13 @@ func (a *LoginAction) FetchQrcodeImage(ctx context.Context) (string, bool, error
+ 	return *src, false, nil
+ }
+ 
++func loginPageURL() string {
++	if configs.BackendFromEnv() == configs.BackendRednote {
++		return configs.WebBaseURL() + "/login"
++	}
++	return configs.WebBaseURL() + "/explore"
++}
++
+ func (a *LoginAction) WaitForLogin(ctx context.Context) bool {
+ 	pp := a.page.Context(ctx)
+ 	ticker := time.NewTicker(500 * time.Millisecond)
+diff --git a/xiaohongshu/login_test.go b/xiaohongshu/login_test.go
+new file mode 100644
+index 0000000..2770c7c
+--- /dev/null
++++ b/xiaohongshu/login_test.go
+@@ -0,0 +1,20 @@
++package xiaohongshu
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/xpzouying/xiaohongshu-mcp/configs"
++)
++
++func TestLoginURL(t *testing.T) {
++	t.Run("xiaohongshu uses explore", func(t *testing.T) {
++		t.Setenv("XHS_BACKEND", configs.BackendXiaohongshu)
++		assert.Equal(t, "https://www.xiaohongshu.com/explore", loginPageURL())
++	})
++
++	t.Run("rednote uses login page", func(t *testing.T) {
++		t.Setenv("XHS_BACKEND", configs.BackendRednote)
++		assert.Equal(t, "https://www.rednote.com/login", loginPageURL())
++	})
++}
+diff --git a/xiaohongshu/navigate.go b/xiaohongshu/navigate.go
+index e12b88a..0b6f7f8 100644
+--- a/xiaohongshu/navigate.go
++++ b/xiaohongshu/navigate.go
+@@ -5,6 +5,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/go-rod/rod"
++	"github.com/xpzouying/xiaohongshu-mcp/configs"
+ )
+ 
+ type NavigateAction struct {
+@@ -18,7 +19,7 @@ func NewNavigate(page *rod.Page) *NavigateAction {
+ func (n *NavigateAction) ToExplorePage(ctx context.Context) error {
+ 	page := n.page.Context(ctx).Timeout(60 * time.Second) // 加超时保护，避免 MustNavigate/MustWaitStable 无限挂
+ 
+-	page.MustNavigate("https://www.xiaohongshu.com/explore").
++	page.MustNavigate(configs.WebBaseURL() + "/explore").
+ 		MustWaitLoad().
+ 		MustElement(`div#app`)
+ 
+diff --git a/xiaohongshu/publish.go b/xiaohongshu/publish.go
+index 4606037..0761785 100644
+--- a/xiaohongshu/publish.go
++++ b/xiaohongshu/publish.go
+@@ -14,6 +14,7 @@ import (
+ 	"github.com/go-rod/rod/lib/proto"
+ 	"github.com/pkg/errors"
+ 	"github.com/sirupsen/logrus"
++	"github.com/xpzouying/xiaohongshu-mcp/configs"
+ 	"github.com/xpzouying/xiaohongshu-mcp/humanize"
+ )
+ 
+@@ -33,16 +34,16 @@ type PublishAction struct {
+ 	page *rod.Page
+ }
+ 
+-const (
+-	urlOfPublic = `https://creator.xiaohongshu.com/publish/publish?source=official`
+-)
++func publishURL() string {
++	return configs.CreatorBaseURL() + "/publish/publish?source=official"
++}
+ 
+ func NewPublishImageAction(page *rod.Page) (*PublishAction, error) {
+ 
+ 	pp := page.Timeout(300 * time.Second)
+ 
+ 	// 使用更稳健的导航和等待策略
+-	if err := pp.Navigate(urlOfPublic); err != nil {
++	if err := pp.Navigate(publishURL()); err != nil {
+ 		return nil, errors.Wrap(err, "导航到发布页面失败")
+ 	}
+ 
+diff --git a/xiaohongshu/publish_video.go b/xiaohongshu/publish_video.go
+index 682f888..e7daf59 100644
+--- a/xiaohongshu/publish_video.go
++++ b/xiaohongshu/publish_video.go
+@@ -27,7 +27,7 @@ type PublishVideoContent struct {
+ func NewPublishVideoAction(page *rod.Page) (*PublishAction, error) {
+ 	pp := page.Timeout(300 * time.Second)
+ 
+-	if err := pp.Navigate(urlOfPublic); err != nil {
++	if err := pp.Navigate(publishURL()); err != nil {
+ 		return nil, errors.Wrap(err, "导航到发布页面失败")
+ 	}
+ 
+diff --git a/xiaohongshu/search.go b/xiaohongshu/search.go
+index 3678fdb..d07d5f9 100644
+--- a/xiaohongshu/search.go
++++ b/xiaohongshu/search.go
+@@ -11,6 +11,7 @@ import (
+ 
+ 	"github.com/go-rod/rod"
+ 	"github.com/sirupsen/logrus"
++	"github.com/xpzouying/xiaohongshu-mcp/configs"
+ 	"github.com/xpzouying/xiaohongshu-mcp/errors"
+ 	"github.com/xpzouying/xiaohongshu-mcp/humanize"
+ )
+@@ -106,8 +107,13 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
+ 
+ 	searchURL := makeSearchURL(keyword)
+ 	page.MustNavigate(searchURL)
+-	page.MustWaitStable()
+-	page.MustWait(`() => window.__INITIAL_STATE__ !== undefined`)
++	page.MustWait(`() => {
++		const feeds = window.__INITIAL_STATE__?.search?.feeds;
++		const value = Array.isArray(feeds)
++			? feeds
++			: (feeds ? (feeds.value !== undefined ? feeds.value : feeds._value) : null);
++		return Array.isArray(value) && value.length > 0;
++	}`)
+ 
+ 	if len(pending) > 0 {
+ 		// 悬停在筛选按钮上展开面板
+@@ -144,7 +150,9 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
+ 		    window.__INITIAL_STATE__.search &&
+ 		    window.__INITIAL_STATE__.search.feeds) {
+ 			const feeds = window.__INITIAL_STATE__.search.feeds;
+-			const feedsData = feeds.value !== undefined ? feeds.value : feeds._value;
++			const feedsData = Array.isArray(feeds)
++				? feeds
++				: (feeds.value !== undefined ? feeds.value : feeds._value);
+ 			if (feedsData) {
+ 				return JSON.stringify(feedsData);
+ 			}
+@@ -167,7 +175,7 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
+ // feedIDsJS 读当前结果集的 id 列表，用来判断数据有没有换一批。
+ const feedIDsJS = `() => {
+ 	const f = window.__INITIAL_STATE__?.search?.feeds;
+-	const v = f ? (f.value !== undefined ? f.value : f._value) : null;
++	const v = Array.isArray(f) ? f : (f ? (f.value !== undefined ? f.value : f._value) : null);
+ 	return v ? v.map(x => x.id).join(",") : "";
+ }`
+ 
+@@ -255,5 +263,5 @@ func makeSearchURL(keyword string) string {
+ 
+ 	//https://www.xiaohongshu.com/search_result?keyword=%25E7%258E%258B%25E5%25AD%2590&source=web_search_result_notes
+ 	//https://www.xiaohongshu.com/search_result?keyword=%25E7%258E%258B%25E5%25AD%2590&source=web_explore_feed
+-	return fmt.Sprintf("https://www.xiaohongshu.com/search_result?%s", values.Encode())
++	return fmt.Sprintf("%s/search_result?%s", configs.WebBaseURL(), values.Encode())
+ }
+diff --git a/xiaohongshu/user_profile.go b/xiaohongshu/user_profile.go
+index 3f56031..7d93c23 100644
+--- a/xiaohongshu/user_profile.go
++++ b/xiaohongshu/user_profile.go
+@@ -7,6 +7,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/go-rod/rod"
++	"github.com/xpzouying/xiaohongshu-mcp/configs"
+ )
+ 
+ type UserProfileAction struct {
+@@ -101,7 +102,7 @@ func (u *UserProfileAction) extractUserProfileData(page *rod.Page) (*UserProfile
+ }
+ 
+ func makeUserProfileURL(userID, xsecToken string) string {
+-	return fmt.Sprintf("https://www.xiaohongshu.com/user/profile/%s?xsec_token=%s&xsec_source=pc_note", userID, xsecToken)
++	return fmt.Sprintf("%s/user/profile/%s?xsec_token=%s&xsec_source=pc_note", configs.WebBaseURL(), userID, xsecToken)
+ }
+ 
+ func (u *UserProfileAction) GetMyProfileViaSidebar(ctx context.Context) (*UserProfileResponse, error) {

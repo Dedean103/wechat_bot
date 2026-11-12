@@ -1,0 +1,420 @@
+diff --git a/browser_slots.go b/browser_slots.go
+new file mode 100644
+index 0000000..46057cf
+--- /dev/null
++++ b/browser_slots.go
+@@ -0,0 +1,34 @@
++package main
++
++import (
++	"context"
++	"fmt"
++	"sync"
++	"time"
++)
++
++const maxResearchBrowsers = 3
++const researchBrowserTimeout = 120 * time.Second
++
++// Shared by all service instances and endpoints, before browser startup.
++var browserSlots = make(chan struct{}, maxResearchBrowsers)
++
++func acquireBrowserSlot(ctx context.Context) (func(), error) {
++	waitCtx, cancel := context.WithTimeout(ctx, researchBrowserTimeout)
++	defer cancel()
++	if err := waitCtx.Err(); err != nil {
++		return nil, fmt.Errorf("browser queue: %w", err)
++	}
++	select {
++	case browserSlots <- struct{}{}:
++		// A cancellation racing with an available slot must not start Chromium.
++		if err := waitCtx.Err(); err != nil {
++			<-browserSlots
++			return nil, fmt.Errorf("browser queue: %w", err)
++		}
++		var once sync.Once
++		return func() { once.Do(func() { <-browserSlots }) }, nil
++	case <-waitCtx.Done():
++		return nil, fmt.Errorf("browser queue: %w", waitCtx.Err())
++	}
++}
+diff --git a/browser_slots_test.go b/browser_slots_test.go
+new file mode 100644
+index 0000000..e0c6e27
+--- /dev/null
++++ b/browser_slots_test.go
+@@ -0,0 +1,82 @@
++package main
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func TestBrowserSlotsCapAndCancellation(t *testing.T) {
++	var releases []func()
++	defer func() {
++		for _, release := range releases {
++			release()
++		}
++	}()
++	for i := 0; i < 3; i++ {
++		release, err := acquireBrowserSlot(context.Background())
++		if err != nil {
++			t.Fatal(err)
++		}
++		releases = append(releases, release)
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
++	defer cancel()
++	if _, err := acquireBrowserSlot(ctx); !errors.Is(err, context.DeadlineExceeded) {
++		t.Fatalf("fourth browser must wait and respect cancellation: %v", err)
++	}
++	// Releasing twice cannot accidentally free a different browser's slot.
++	releases[0]()
++	releases[0]()
++	release, err := acquireBrowserSlot(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	releases = append(releases, release)
++	if len(browserSlots) != 3 {
++		t.Fatalf("expected three occupied slots, got %d", len(browserSlots))
++	}
++}
++
++func TestBrowserSlotsConcurrentRequests(t *testing.T) {
++	var workers sync.WaitGroup
++	var active, peak atomic.Int32
++	for i := 0; i < 30; i++ {
++		workers.Add(1)
++		go func() {
++			defer workers.Done()
++			release, err := acquireBrowserSlot(context.Background())
++			if err != nil {
++				t.Error(err)
++				return
++			}
++			n := active.Add(1)
++			for old := peak.Load(); n > old; old = peak.Load() {
++				if peak.CompareAndSwap(old, n) {
++					break
++				}
++			}
++			time.Sleep(time.Millisecond)
++			active.Add(-1)
++			release()
++		}()
++	}
++	workers.Wait()
++	if peak.Load() > 3 || len(browserSlots) != 0 {
++		t.Fatalf("peak=%d, leaked slots=%d", peak.Load(), len(browserSlots))
++	}
++}
++
++func TestCancelledRequestDoesNotAcquireAvailableSlot(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if _, err := acquireBrowserSlot(ctx); !errors.Is(err, context.Canceled) {
++		t.Fatalf("expected cancellation, got %v", err)
++	}
++	if len(browserSlots) != 0 {
++		t.Fatal("cancelled request leaked a slot")
++	}
++}
+diff --git a/service.go b/service.go
+index 7368ec0..2d19fcd 100644
+--- a/service.go
++++ b/service.go
+@@ -5,6 +5,7 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"os"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/go-rod/rod"
+@@ -23,6 +24,7 @@ type XiaohongshuService struct{}
+ 
+ // NewXiaohongshuService 创建小红书服务实例
+ func NewXiaohongshuService() *XiaohongshuService {
++	logrus.Infof("browser concurrency limit=%d; research operation/queue timeout=%s", maxResearchBrowsers, researchBrowserTimeout)
+ 	return &XiaohongshuService{}
+ }
+ 
+@@ -103,7 +105,10 @@ func (s *XiaohongshuService) DeleteCookies(ctx context.Context) error {
+ 
+ // CheckLoginStatus 检查登录状态
+ func (s *XiaohongshuService) CheckLoginStatus(ctx context.Context) (*LoginStatusResponse, error) {
+-	b := newBrowser()
++	b, err := newBrowser(ctx)
++	if err != nil {
++		return nil, err
++	}
+ 	defer b.Close()
+ 
+ 	page := b.NewPage()
+@@ -135,8 +140,22 @@ func (s *XiaohongshuService) CheckLoginStatus(ctx context.Context) (*LoginStatus
+ 
+ // GetLoginQrcode 获取登录的扫码二维码
+ func (s *XiaohongshuService) GetLoginQrcode(ctx context.Context) (*LoginQrcodeResponse, error) {
+-	b := newBrowser()
++	b, err := newBrowser(ctx)
++	if err != nil {
++		return nil, err
++	}
++	background := false
++	defer func() {
++		if !background {
++			b.Close()
++		}
++	}()
+ 	page := b.NewPage()
++	defer func() {
++		if !background {
++			_ = page.Close()
++		}
++	}()
+ 
+ 	deferFunc := func() {
+ 		_ = page.Close()
+@@ -146,9 +165,6 @@ func (s *XiaohongshuService) GetLoginQrcode(ctx context.Context) (*LoginQrcodeRe
+ 	loginAction := xiaohongshu.NewLogin(page)
+ 
+ 	img, loggedIn, err := loginAction.FetchQrcodeImage(ctx)
+-	if err != nil || loggedIn {
+-		defer deferFunc()
+-	}
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -156,6 +172,7 @@ func (s *XiaohongshuService) GetLoginQrcode(ctx context.Context) (*LoginQrcodeRe
+ 	timeout := 4 * time.Minute
+ 
+ 	if !loggedIn {
++		background = true // The login waiter owns cleanup until it finishes.
+ 		go func() {
+ 			ctxTimeout, cancel := context.WithTimeout(context.Background(), timeout)
+ 			defer cancel()
+@@ -256,7 +273,10 @@ func (s *XiaohongshuService) processImages(images []string) ([]string, error) {
+ 
+ // publishContent 执行内容发布
+ func (s *XiaohongshuService) publishContent(ctx context.Context, content xiaohongshu.PublishImageContent) error {
+-	b := newBrowser()
++	b, err := newBrowser(ctx)
++	if err != nil {
++		return err
++	}
+ 	defer b.Close()
+ 
+ 	page := b.NewPage()
+@@ -339,7 +359,10 @@ func (s *XiaohongshuService) PublishVideo(ctx context.Context, req *PublishVideo
+ 
+ // publishVideo 执行视频发布
+ func (s *XiaohongshuService) publishVideo(ctx context.Context, content xiaohongshu.PublishVideoContent) error {
+-	b := newBrowser()
++	b, err := newBrowser(ctx)
++	if err != nil {
++		return err
++	}
+ 	defer b.Close()
+ 
+ 	page := b.NewPage()
+@@ -355,7 +378,10 @@ func (s *XiaohongshuService) publishVideo(ctx context.Context, content xiaohongs
+ 
+ // ListFeeds 获取Feeds列表
+ func (s *XiaohongshuService) ListFeeds(ctx context.Context) (*FeedsListResponse, error) {
+-	b := newBrowser()
++	b, err := newBrowser(ctx)
++	if err != nil {
++		return nil, err
++	}
+ 	defer b.Close()
+ 
+ 	page := b.NewPage()
+@@ -380,9 +406,15 @@ func (s *XiaohongshuService) ListFeeds(ctx context.Context) (*FeedsListResponse,
+ }
+ 
+ func (s *XiaohongshuService) SearchFeeds(ctx context.Context, keyword string, filters ...xiaohongshu.FilterOption) (*FeedsListResponse, error) {
+-	b := newBrowser()
++	b, err := newBrowser(ctx)
++	if err != nil {
++		return nil, err
++	}
+ 	defer b.Close()
+ 
++	ctx, cancel := context.WithTimeout(ctx, researchBrowserTimeout)
++	defer cancel()
++
+ 	page := b.NewPage()
+ 	defer page.Close()
+ 
+@@ -408,9 +440,15 @@ func (s *XiaohongshuService) GetFeedDetail(ctx context.Context, feedID, xsecToke
+ 
+ // GetFeedDetailWithConfig 使用配置获取Feed详情
+ func (s *XiaohongshuService) GetFeedDetailWithConfig(ctx context.Context, feedID, xsecToken string, loadAllComments bool, config xiaohongshu.CommentLoadConfig) (*FeedDetailResponse, error) {
+-	b := newBrowser()
++	b, err := newBrowser(ctx)
++	if err != nil {
++		return nil, err
++	}
+ 	defer b.Close()
+ 
++	ctx, cancel := context.WithTimeout(ctx, researchBrowserTimeout)
++	defer cancel()
++
+ 	page := b.NewPage()
+ 	defer page.Close()
+ 
+@@ -433,7 +471,10 @@ func (s *XiaohongshuService) GetFeedDetailWithConfig(ctx context.Context, feedID
+ 
+ // UserProfile 获取用户信息
+ func (s *XiaohongshuService) UserProfile(ctx context.Context, userID, xsecToken string) (*UserProfileResponse, error) {
+-	b := newBrowser()
++	b, err := newBrowser(ctx)
++	if err != nil {
++		return nil, err
++	}
+ 	defer b.Close()
+ 
+ 	page := b.NewPage()
+@@ -457,7 +498,10 @@ func (s *XiaohongshuService) UserProfile(ctx context.Context, userID, xsecToken
+ 
+ // PostCommentToFeed 发表评论到Feed
+ func (s *XiaohongshuService) PostCommentToFeed(ctx context.Context, feedID, xsecToken, content string) (*PostCommentResponse, error) {
+-	b := newBrowser()
++	b, err := newBrowser(ctx)
++	if err != nil {
++		return nil, err
++	}
+ 	defer b.Close()
+ 
+ 	page := b.NewPage()
+@@ -474,7 +518,10 @@ func (s *XiaohongshuService) PostCommentToFeed(ctx context.Context, feedID, xsec
+ 
+ // LikeFeed 点赞笔记
+ func (s *XiaohongshuService) LikeFeed(ctx context.Context, feedID, xsecToken string) (*ActionResult, error) {
+-	b := newBrowser()
++	b, err := newBrowser(ctx)
++	if err != nil {
++		return nil, err
++	}
+ 	defer b.Close()
+ 
+ 	page := b.NewPage()
+@@ -489,7 +536,10 @@ func (s *XiaohongshuService) LikeFeed(ctx context.Context, feedID, xsecToken str
+ 
+ // UnlikeFeed 取消点赞笔记
+ func (s *XiaohongshuService) UnlikeFeed(ctx context.Context, feedID, xsecToken string) (*ActionResult, error) {
+-	b := newBrowser()
++	b, err := newBrowser(ctx)
++	if err != nil {
++		return nil, err
++	}
+ 	defer b.Close()
+ 
+ 	page := b.NewPage()
+@@ -504,7 +554,10 @@ func (s *XiaohongshuService) UnlikeFeed(ctx context.Context, feedID, xsecToken s
+ 
+ // FavoriteFeed 收藏笔记
+ func (s *XiaohongshuService) FavoriteFeed(ctx context.Context, feedID, xsecToken string) (*ActionResult, error) {
+-	b := newBrowser()
++	b, err := newBrowser(ctx)
++	if err != nil {
++		return nil, err
++	}
+ 	defer b.Close()
+ 
+ 	page := b.NewPage()
+@@ -519,7 +572,10 @@ func (s *XiaohongshuService) FavoriteFeed(ctx context.Context, feedID, xsecToken
+ 
+ // UnfavoriteFeed 取消收藏笔记
+ func (s *XiaohongshuService) UnfavoriteFeed(ctx context.Context, feedID, xsecToken string) (*ActionResult, error) {
+-	b := newBrowser()
++	b, err := newBrowser(ctx)
++	if err != nil {
++		return nil, err
++	}
+ 	defer b.Close()
+ 
+ 	page := b.NewPage()
+@@ -534,7 +590,10 @@ func (s *XiaohongshuService) UnfavoriteFeed(ctx context.Context, feedID, xsecTok
+ 
+ // ReplyCommentToFeed 回复指定评论
+ func (s *XiaohongshuService) ReplyCommentToFeed(ctx context.Context, feedID, xsecToken, commentID, userID, content string) (*ReplyCommentResponse, error) {
+-	b := newBrowser()
++	b, err := newBrowser(ctx)
++	if err != nil {
++		return nil, err
++	}
+ 	defer b.Close()
+ 
+ 	page := b.NewPage()
+@@ -555,11 +614,38 @@ func (s *XiaohongshuService) ReplyCommentToFeed(ctx context.Context, feedID, xse
+ 	}, nil
+ }
+ 
+-func newBrowser() *headless_browser.Browser {
+-	return browser.NewBrowser(configs.IsHeadless(),
++// limitedBrowser holds its slot until Chromium has been closed, including QR login.
++type limitedBrowser struct {
++	*headless_browser.Browser
++	release func()
++	once    sync.Once
++}
++
++func (b *limitedBrowser) Close() {
++	b.once.Do(func() {
++		defer b.release()
++		b.Browser.Close()
++	})
++}
++
++func newBrowser(ctx context.Context) (*limitedBrowser, error) {
++	release, err := acquireBrowserSlot(ctx)
++	if err != nil {
++		return nil, err
++	}
++	// Browser startup can panic; never leak a permit on that path.
++	created := false
++	defer func() {
++		if !created {
++			release()
++		}
++	}()
++	b := browser.NewBrowser(configs.IsHeadless(),
+ 		browser.WithFingerprintSeed(configs.FingerprintSeed()),
+ 		browser.WithProxy(configs.Proxy()),
+ 	)
++	created = true
++	return &limitedBrowser{Browser: b, release: release}, nil
+ }
+ 
+ func saveCookies(page *rod.Page) error {
+@@ -578,8 +664,11 @@ func saveCookies(page *rod.Page) error {
+ }
+ 
+ // withBrowserPage 执行需要浏览器页面的操作的通用函数
+-func withBrowserPage(fn func(*rod.Page) error) error {
+-	b := newBrowser()
++func withBrowserPage(ctx context.Context, fn func(*rod.Page) error) error {
++	b, err := newBrowser(ctx)
++	if err != nil {
++		return err
++	}
+ 	defer b.Close()
+ 
+ 	page := b.NewPage()
+@@ -593,7 +682,7 @@ func (s *XiaohongshuService) GetMyProfile(ctx context.Context) (*UserProfileResp
+ 	var result *xiaohongshu.UserProfileResponse
+ 	var err error
+ 
+-	err = withBrowserPage(func(page *rod.Page) error {
++	err = withBrowserPage(ctx, func(page *rod.Page) error {
+ 		action := xiaohongshu.NewUserProfileAction(page)
+ 		result, err = action.GetMyProfileViaSidebar(ctx)
+ 		return err

@@ -81,24 +81,50 @@ class DurableResearchTests(unittest.TestCase):
         self.assertEqual(job["failure_stage"], "model_routing")
         self.assertTrue(any("关键发现 A" in item["text"] for item in job["partial_findings"]))
 
-    def test_retry_exhaustion_sends_one_failure_notification(self):
+    def test_execution_failures_keep_retrying_after_five_minutes(self):
         bot = self.make_bot()
         task_id = bot._create_research_job("调研测试", "web")
-        bot._research_mark_running(task_id)
-        bot._research_fail(task_id, "model_execution", "timeout")
-        bot._research_transition(task_id, "queued", reason="test retry due")
-        bot._research_mark_running(task_id)
-        bot._research_fail(task_id, "model_execution", "timeout")
-        bot._research_transition(task_id, "queued", reason="test retry due")
-        bot._research_mark_running(task_id)
-        bot._research_fail(task_id, "model_execution", "timeout")
         job = bot.state["research_jobs"][task_id]
-        self.assertEqual(job["status"], "failed")
-        self.assertEqual(job["failure_notification"]["state"], "sent")
-        self.assertEqual(bot._send_research_message.call_count, 1)
-        message = bot._research_failure_text(job)
-        self.assertIn(task_id, message)
-        self.assertIn("调研执行 3 轮", message)
+        job["max_attempts"] = 3  # Legacy persisted limit must not stop recovery.
+        for attempt in range(1, 6):
+            bot._research_mark_running(task_id)
+            with patch.object(bridge.time, "time", return_value=1800000000):
+                bot._research_fail(task_id, "model_execution", "timeout")
+            self.assertEqual(job["status"], "retry_wait")
+            self.assertEqual(job["attempts"], attempt)
+            self.assertEqual(bot._research_ts(job["next_retry_ts"]), 1800000300)
+            self.assertIsNone(bot._research_mark_running(task_id))
+            self.assertFalse(bot._research_queue_item(task_id))
+            bot._research_transition(task_id, "queued", reason="test retry due")
+        bot._send_research_message.assert_not_called()
+
+    def test_scheduler_waits_until_due_and_cancellation_stops_recovery(self):
+        bot = self.make_bot()
+        task_id = bot._create_research_job("调研测试", "web")
+        bot._research_mark_running(task_id, "checkpoint-session")
+        bot._research_checkpoint(task_id, partial="已读两篇笔记")
+        job = bot.state["research_jobs"][task_id]
+        with patch.object(bridge.time, "time", return_value=1800000000):
+            bot._research_fail(task_id, "browser_page", "timeout")
+        for now, expected_count in ((1800000299, 0), (1800000300, 1), (1800000301, 1)):
+            with patch.object(bridge.time, "time", return_value=now), \
+                    patch.object(bridge.time, "sleep", side_effect=StopIteration):
+                with self.assertRaises(StopIteration):
+                    bot._research_retry_loop()
+            self.assertEqual(len(bot.task_q), expected_count)
+        self.assertEqual(job["session_id"], "checkpoint-session")
+        self.assertEqual(job["partial_findings"][0]["text"], "已读两篇笔记")
+        bot.task_q.clear()
+        bot._research_mark_running(task_id)
+        bot._research_fail(task_id, "browser_page", "timeout")
+        bot._cancel_research_jobs()
+        with patch.object(bridge.time, "time", return_value=2800000000), \
+                patch.object(bridge.time, "sleep", side_effect=StopIteration):
+            with self.assertRaises(StopIteration):
+                bot._research_retry_loop()
+        bot._restore_research_jobs()
+        self.assertEqual(job["status"], "cancelled")
+        self.assertFalse(bot.task_q)
 
     def test_restart_recovers_running_job_without_resuming_helper(self):
         bot = self.make_bot()
@@ -107,9 +133,14 @@ class DurableResearchTests(unittest.TestCase):
         bot.task_q.clear()
         bot._restore_research_jobs()
         job = bot.state["research_jobs"][task_id]
-        self.assertEqual(job["status"], "queued")
+        self.assertEqual(job["status"], "retry_wait")
         self.assertEqual(job["session_id"], "sid-1")
-        self.assertEqual(bot.task_q[0]["research_task_id"], task_id)
+        self.assertFalse(bot.task_q)
+        due = bot._research_ts(job["next_retry_ts"])
+        self.assertAlmostEqual(due - bridge.time.time(), 300, delta=2)
+        bot._restore_research_jobs()
+        self.assertEqual(bot._research_ts(job["next_retry_ts"]), due)
+        self.assertFalse(bot.task_q)
 
     def test_delivery_retry_reuses_archived_paths(self):
         bot = self.make_bot()
@@ -177,7 +208,7 @@ class DurableResearchTests(unittest.TestCase):
             bot.save_state = bridge.Bridge.save_state.__get__(bot)
             task_id = bot._create_research_job("调研测试", "web")
             bot._research_mark_running(task_id)
-            bot.state["research_jobs"][task_id]["attempts"] = bridge.RESEARCH_MAX_ATTEMPTS
+            bot.state["research_jobs"][task_id]["attempts"] = 3
             bot.save_state()
             loaded = bridge.json.loads(state_file.read_text(encoding="utf-8"))
             restored = self.make_bot()
@@ -186,10 +217,17 @@ class DurableResearchTests(unittest.TestCase):
             restored.task_q = bridge.deque()
             restored._restore_research_jobs()
         job = restored.state["research_jobs"][task_id]
-        self.assertEqual(job["status"], "failed")
-        self.assertEqual(job["failure_notification"]["state"], "sent")
-        self.assertEqual(restored._send_research_message.call_count, 1)
+        self.assertEqual(job["status"], "retry_wait")
+        self.assertEqual(job["attempts"], 3)
+        self.assertEqual(job["session_id"], None)
+        restored._send_research_message.assert_not_called()
         self.assertFalse(restored.task_q)
+        with patch.object(bridge.time, "time", return_value=restored._research_ts(job["next_retry_ts"])):
+            restored._restore_research_jobs()
+            restored._restore_research_jobs()
+        self.assertEqual(len(restored.task_q), 1)
+        self.assertIsNotNone(restored._research_mark_running(task_id))
+        self.assertEqual(job["attempts"], 4)
 
     def test_bridge_init_deduplicates_legacy_research_queues(self):
         temp = tempfile.TemporaryDirectory()
@@ -224,8 +262,8 @@ class DurableResearchTests(unittest.TestCase):
             bot = bridge.Bridge()
         self.assertFalse(bot.reply_q)
         research_items = [item for item in bot.task_q if isinstance(item, dict) and item.get("research_task_id") == task_id]
-        self.assertEqual(len(research_items), 1)
-        self.assertEqual(bot.state["research_jobs"][task_id]["status"], "queued")
+        self.assertEqual(len(research_items), 0)
+        self.assertEqual(bot.state["research_jobs"][task_id]["status"], "retry_wait")
 
     def test_followup_status_does_not_invoke_reminder_or_model(self):
         bot = self.make_bot()
@@ -239,11 +277,7 @@ class DurableResearchTests(unittest.TestCase):
     def test_followup_retry_restarts_failed_job_without_new_report_request(self):
         bot = self.make_bot()
         task_id = bot._create_research_job("调研测试", "web")
-        for _ in range(bridge.RESEARCH_MAX_ATTEMPTS):
-            bot._research_mark_running(task_id)
-            bot._research_fail(task_id, "model_execution", "timeout")
-            if _ + 1 < bridge.RESEARCH_MAX_ATTEMPTS:
-                bot._research_transition(task_id, "queued", reason="test retry due")
+        bot._research_transition(task_id, "failed", reason="legacy exhausted execution")
         bot.send_weixin.reset_mock()
         self.assertTrue(bot._handle_research_followup(f"重试 {task_id}"))
         self.assertEqual(bot.state["research_jobs"][task_id]["status"], "queued")
@@ -386,7 +420,7 @@ class DurableResearchTests(unittest.TestCase):
         bot._research_transition(task_id, "failed", reason="timeout")
         job = bot.state["research_jobs"][task_id]
         text = bot._research_failure_text(job)
-        self.assertIn("2026-10-27T", text)
+        self.assertIn(job["created_ts"].split("+")[0], text)
         self.assertIn("Z", text)
         self.assertIn(f"{bridge.STATE_FILE}/{task_id}", text)
 

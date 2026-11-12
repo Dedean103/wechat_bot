@@ -44,7 +44,15 @@ from collections import deque
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from research_diagnostics import capture_diagnostics
-from Crypto.Cipher import AES
+try:
+    import Crypto
+    from Crypto.Cipher import AES
+except ModuleNotFoundError as exc:
+    if exc.name != "Crypto":
+        raise
+    # Debian installs PyCryptodome under the Cryptodome namespace.
+    import Cryptodome as Crypto
+    from Cryptodome.Cipher import AES
 
 HERE = Path(__file__).parent
 REPO_ROOT = HERE.parent.parent
@@ -90,7 +98,7 @@ REPLY_TIMEOUT = 600
 TURN_HANG_TIMEOUT = 90    # 常驻连接单轮无任何事件超过此秒数视为卡死，静默自愈重试
 RESEARCH_HANG_TIMEOUT = 360  # Browser queue + operation must finish before inactivity interruption.
 RESEARCH_TOTAL_TIMEOUT = 20 * 60  # Shared across retries for one research execution.
-RESEARCH_MAX_ATTEMPTS = 3
+RESEARCH_RETRY_DELAY = 5 * 60  # Persist execution retries until completion or user cancellation.
 RESEARCH_MAX_DELIVERY_ATTEMPTS = 3
 RESEARCH_RETRY_BASE = 30
 RESEARCH_RETRY_MAX = 15 * 60
@@ -218,7 +226,7 @@ RESEARCH_ARCHIVE_DIR = REPO_ROOT / "ai" / "memo" / "investigation"
 AI_MEMO_DIR = REPO_ROOT / "ai" / "memo"
 KNOWLEDGE_FILE = REPO_ROOT / "ai" / "memo" / "knowledge.md"
 DIARY_FILE = REPO_ROOT / "ai" / "memo" / "diary.md"
-NOTION_DIARY_MANAGER_FILE = Path("/home/dedeanzheng/test_env/schduler/notion/notion_diary.py")
+NOTION_DIARY_MANAGER_FILE = Path("/home/octopuszheng/test_env/schduler/notion/notion_diary.py")
 _NOTION_DIARY_MANAGER_CLASS = None
 
 # ── 稳定性参数 ──────────────────────────────────────────────────────
@@ -449,7 +457,7 @@ def _research_instruction(route):
 """
     if route == "xhs":
         return common + """【来源路由：小红书】
-浏览器调用每批最多 3 个，上一批完成后再开始下一批。
+小红书浏览器调用必须串行执行：每次只调用一个登录检查、搜索或笔记详情工具，等待返回后再发起下一次；不得用 Promise.all 等方式并发打开多个浏览器。
 用户明确要求用小红书调研。必须使用当前设备已安装的 xhs-research / xiaohongshu 技能流程：先检查 MCP 可用性与登录状态，再用小红书 MCP 检索、阅读详情和评论。严格遵守该技能的固定报告格式；参考来源列为“参考笔记”，不得用普通网页搜索替代小红书调研。
 """
     return common + """【来源路由：普通网页】
@@ -2974,7 +2982,6 @@ class Bridge:
                 "route": route or _research_request(request_text) or "unknown",
                 "status": "queued",
                 "attempts": 0,
-                "max_attempts": RESEARCH_MAX_ATTEMPTS,
                 "next_retry_ts": None,
                 "session_id": None,
                 "partial_findings": [],
@@ -3057,40 +3064,25 @@ class Bridge:
             self.save_state()
 
     def _research_mark_running(self, task_id, session_id=None):
-        notify_failure = False
         with self._research_lock:
             job = self._research_jobs().get(task_id)
             account = getattr(self, "account", {}) or {}
             if not job or job.get("account_id") != (account.get("account_id") or ""):
                 return None
-            # A worker may claim only a queued research execution.  In
-            # particular, retry_wait is not an implicit bypass of backoff and
-            # running is never claimed a second time after a duplicate queue item.
-            if job.get("status") != "queued":
+            # Only the scheduler can release a waiting job after its cooldown.
+            if job.get("status") != "queued" or job.get("cancel_requested"):
                 return None
-            if int(job.get("attempts") or 0) >= int(job.get("max_attempts") or RESEARCH_MAX_ATTEMPTS):
-                self._research_transition_locked(job, "failed", reason="retry exhaustion before claim",
-                                                  next_retry_ts=None, queue_enqueued=False,
-                                                  failure_stage=job.get("failure_stage") or "retry_limit",
-                                                  failure_reason=job.get("failure_reason") or "maximum attempts reached")
-                self.save_state()
-                notify_failure = True
-                result = None
-            else:
-                job["attempts"] = int(job.get("attempts") or 0) + 1
-                job["started_ts"] = self._research_now()
-                job["next_retry_ts"] = None
-                job["queue_enqueued"] = False
-                job["failure_stage"] = ""
-                job["failure_reason"] = ""
-                job["claim_token"] = uuid.uuid4().hex
-                self._research_transition_locked(job, "running", reason=f"attempt {job['attempts']}",
-                                                  session_id=session_id or job.get("session_id"))
-                self.save_state()
-                result = job
-        if notify_failure:
-            self._notify_research_failure(task_id)
-        return result
+            job["attempts"] = int(job.get("attempts") or 0) + 1
+            job["started_ts"] = self._research_now()
+            job["next_retry_ts"] = None
+            job["queue_enqueued"] = False
+            job["failure_stage"] = ""
+            job["failure_reason"] = ""
+            job["claim_token"] = uuid.uuid4().hex
+            self._research_transition_locked(job, "running", reason=f"attempt {job['attempts']}",
+                                              session_id=session_id or job.get("session_id"))
+            self.save_state()
+            return job
 
     def _research_queue_item(self, task_id, front=False):
         with self._research_lock:
@@ -3119,7 +3111,7 @@ class Bridge:
             return True
 
     def _research_fail(self, task_id, stage, reason):
-        """Checkpoint a failed attempt and schedule bounded retry or terminal failure."""
+        """Checkpoint an execution failure and resume after a five-minute cooldown."""
         try:
             from research_diagnostics import redact_diagnostic
             safe_reason = redact_diagnostic(reason)
@@ -3143,19 +3135,12 @@ class Bridge:
                 self.save_state()
                 return job
             attempts = int(job.get("attempts") or 0)
-            if attempts < int(job.get("max_attempts") or RESEARCH_MAX_ATTEMPTS):
-                delay = min(RESEARCH_RETRY_MAX, RESEARCH_RETRY_BASE * (2 ** max(0, attempts - 1)))
-                next_ts = datetime.now(timezone.utc).timestamp() + delay
-                next_iso = datetime.fromtimestamp(next_ts, timezone.utc).replace(microsecond=0).isoformat()
-                self._research_transition_locked(job, "retry_wait", reason=f"attempt {attempts} failed",
-                                                  next_retry_ts=next_iso, queue_enqueued=False)
-                self.save_state()
-                log(f"调研任务 {task_id} 将在 {next_iso} 重试（{stage}: {safe_reason}）")
-                return job
-            self._research_transition_locked(job, "failed", reason="retry exhaustion", next_retry_ts=None)
+            next_iso = datetime.fromtimestamp(time.time() + RESEARCH_RETRY_DELAY, timezone.utc).replace(microsecond=0).isoformat()
+            self._research_transition_locked(job, "retry_wait", reason=f"attempt {attempts} failed",
+                                              next_retry_ts=next_iso, queue_enqueued=False)
             self.save_state()
-        self._notify_research_failure(task_id)
-        return self._research_jobs().get(task_id)
+            log(f"调研任务 {task_id} 将在 {next_iso} 重试（{stage}: {safe_reason}）")
+            return job
 
     def _research_mark_delivery(self, task_id):
         """Atomically claim one delivery attempt before any external send."""
@@ -3408,7 +3393,6 @@ class Bridge:
         with self._research_lock:
             jobs = self._research_jobs()
             now = time.time()
-            exhausted = []
             for task_id, job in list(jobs.items()):
                 if job.get("account_id") != (self.account.get("account_id") or ""):
                     continue
@@ -3458,22 +3442,15 @@ class Bridge:
                     elif note.get("state") in {None, "none"} and not note.get("superseded"):
                         note["state"] = "pending"
                         note["next_retry_ts"] = self._research_now()
-                if job.get("status") == "running":
-                    if int(job.get("attempts") or 0) >= int(job.get("max_attempts") or RESEARCH_MAX_ATTEMPTS):
-                        self._research_transition_locked(job, "failed", reason="retry exhaustion after restart",
-                                                          next_retry_ts=None, queue_enqueued=False,
-                                                          failure_stage="restart_recovery",
-                                                          failure_reason="bridge restarted after max attempts")
-                        exhausted.append(task_id)
-                    else:
-                        self._research_transition_locked(job, "retry_wait", reason="bridge restart recovery",
-                                                          next_retry_ts=self._research_now(), queue_enqueued=False,
-                                                          failure_stage="restart_recovery",
-                                                          failure_reason="bridge restarted during execution")
-                if job.get("status") == "retry_wait" and int(job.get("attempts") or 0) >= int(job.get("max_attempts") or RESEARCH_MAX_ATTEMPTS):
-                    self._research_transition_locked(job, "failed", reason="retry exhaustion",
+                if job.get("status") in {"running", "retry_wait", "queued"} and job.get("cancel_requested"):
+                    self._research_transition_locked(job, "cancelled", reason="user cancellation",
                                                       next_retry_ts=None, queue_enqueued=False)
-                    exhausted.append(task_id)
+                if job.get("status") == "running":
+                    next_iso = datetime.fromtimestamp(now + RESEARCH_RETRY_DELAY, timezone.utc).replace(microsecond=0).isoformat()
+                    self._research_transition_locked(job, "retry_wait", reason="bridge restart recovery",
+                                                      next_retry_ts=next_iso, queue_enqueued=False,
+                                                      failure_stage="restart_recovery",
+                                                      failure_reason="bridge restarted during execution")
                 if job.get("status") == "retry_wait" and self._research_ts(job.get("next_retry_ts")) <= now:
                     self._research_transition_locked(job, "queued", reason="retry due", queue_enqueued=False)
                 if job.get("status") == "queued":
@@ -3483,8 +3460,6 @@ class Bridge:
             # Legacy plain task entries remain ordinary tasks.  New research
             # jobs are represented by task-id envelopes and are deduplicated.
             self.save_state()
-        for task_id in exhausted:
-            self._notify_research_failure(task_id)
 
     def _research_delivery_pending(self, job):
         delivery = job.get("delivery") or {}
@@ -5229,7 +5204,6 @@ def doctor():
     print(f"data_dir: {DATA_DIR}")
     print(f"script: {Path(__file__).resolve()}")
     try:
-        import Crypto
         print(f"pycryptodome: OK ({Crypto.__version__})")
     except Exception as e:
         print(f"pycryptodome: MISSING ({e})")

@@ -1,0 +1,4 @@
+interface:
+  display_name: "小红书调研"
+  short_description: "系统化调研小红书方案、价格、配置、评论与潜在风险分析"
+  default_prompt: "按标准链路调研这个主题：验证登录，搜索筛选笔记，读取详情和评论，提取配置与价格，归纳短板并生成结构化结论。"

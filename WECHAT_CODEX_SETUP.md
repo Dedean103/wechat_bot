@@ -217,6 +217,14 @@ preferred research presentation: conclusion first, scope, comparison table,
 key evidence/cost or configuration breakdown, risks, recommendation,
 limitations, and sources (小红书 reports label their sources as `参考笔记`).
 
+Execution failures and interrupted executions after a bridge restart retain their
+session and partial findings, wait five minutes, then resume automatically.
+The persisted retry deadline survives further restarts. Execution attempts have
+no three-attempt cutoff; retries stop when the report completes or the user
+cancels. Archived-file delivery retains its separate bounded retry and ambiguous
+send handling. XHS browser calls are instructed to run one at a time to reduce
+memory pressure.
+
 The bridge saves the Markdown original in `ai/memo/investigation/`, creates a
 TXT sibling with byte-for-byte identical content, and sends the TXT file (not
 the Markdown) back through WeChat. It also sends a standalone, approximately

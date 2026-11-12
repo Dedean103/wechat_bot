@@ -1,0 +1,19 @@
+[Unit]
+Description=Xiaohongshu MCP (RedNote account)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/home/octopuszheng/xhs
+Environment=XHS_BACKEND=rednote
+ExecStart=/home/octopuszheng/xhs/xiaohongshu-mcp/bin/xiaohongshu-mcp -headless=true -port 127.0.0.1:18060
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+UMask=0077
+
+[Install]
+WantedBy=default.target

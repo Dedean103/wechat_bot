@@ -1,0 +1,9 @@
+# ~/.codex/config.toml 片段
+# 改完配置必须重启会话（Codex 的 MCP 工具列表在启动时加载）
+
+[mcp_servers.xiaohongshu-mcp]
+url = "http://127.0.0.1:18060/mcp"
+
+# 清 Cookie 会丢登录态，要求逐次确认
+[mcp_servers.xiaohongshu-mcp.tools.delete_cookies]
+approval_mode = "approve"
